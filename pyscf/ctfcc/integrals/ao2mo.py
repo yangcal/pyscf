@@ -212,8 +212,8 @@ def _make_fftdf_eris(mycc, mo_a, mo_b, nocca, noccb, out=None):
         abG.write(off*idx_vvG.size+idx_vvG, v[nocca:,nocca:].ravel())
 
     cput1 = logger.timer(mycc, "generating (pq|G)", *cput1)
-    sym1 = ["+-+", [kpts,]*3, None, gvec]
-    sym2 = ["+--", [kpts,]*3, None, gvec]
+    sym1 = ["+-+", [kpts,kpts, kpts[0]-kpts], None, gvec]
+    sym2 = ["+--", [kpts,kpts, kpts[0]-kpts], None, gvec]
 
     ooG = tensor(ijG, sym1, verbose=mycc.SYMVERBOSE)
     ovG = tensor(iaG, sym1, verbose=mycc.SYMVERBOSE)
@@ -223,7 +223,7 @@ def _make_fftdf_eris(mycc, mo_a, mo_b, nocca, noccb, out=None):
     ovR = tensor(iaR, sym2, verbose=mycc.SYMVERBOSE)
     voR = tensor(aiR, sym2, verbose=mycc.SYMVERBOSE)
     vvR = tensor(abR, sym2, verbose=mycc.SYMVERBOSE)
-
+ 
     oooo = einsum('ijg,klg->ijkl', ooG, ooR)/ nkpts
     ooov = einsum('ijg,kag->ijka', ooG, ovR)/ nkpts
     oovv = einsum('ijg,abg->ijab', ooG, vvR)/ nkpts
@@ -235,6 +235,7 @@ def _make_fftdf_eris(mycc, mo_a, mo_b, nocca, noccb, out=None):
     ovG = iaG = None
     vvvv = einsum('abg,cdg->abcd', vvG, vvR)/ nkpts
     cput1 = logger.timer(mycc, "(pq|G) to (pq|rs)", *cput1)
+
     if out is None:
         return oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv
     else:
