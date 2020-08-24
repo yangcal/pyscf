@@ -49,6 +49,7 @@ from pyscf.data.elements import ELEMENTS, ELEMENTS_PROTON, \
         _std_symbol_without_ghost
 
 from pyscf.lib.exceptions import BasisNotFoundError
+import warnings
 
 # For code compatibility in python-2 and python-3
 if sys.version_info >= (3,):
@@ -448,16 +449,39 @@ def uncontracted_basis(_basis):
     >>> gto.uncontract(gto.load('sto3g', 'He'))
     [[0, [6.36242139, 1]], [0, [1.158923, 1]], [0, [0.31364979, 1]]]
     '''
-    ubasis = []
+    MAXL = 10
+    ubasis_raw = [[] for l in range(MAXL)]
+    ubasis_exp = [[] for l in range(MAXL)]
     for b in _basis:
         angl = b[0]
-        if isinstance(b[1], int):
-            kappa = b[1]
-            for p in b[2:]:
-                ubasis.append([angl, kappa, [p[0], 1]])
+        kappa = b[1]
+        if isinstance(kappa, int):
+            coeffs = b[2:]
         else:
-            for p in b[1:]:
-                ubasis.append([angl, [p[0], 1]])
+            coeffs = b[1:]
+
+        if isinstance(kappa, int) and kappa != 0:
+            warnings.warn('For basis with kappa != 0, the uncontract basis might be wrong. '
+                          'Please double check the resultant attribute mol._basis')
+            for p in coeffs:
+                ubasis_raw[angl].append([angl, kappa, [p[0], 1]])
+                ubasis_exp[angl].append(p[0])
+        else:
+            for p in coeffs:
+                ubasis_raw[angl].append([angl, [p[0], 1]])
+                ubasis_exp[angl].append(p[0])
+
+    # Check linear dependency
+    ubasis = []
+    for l in range(MAXL):
+        basis_l = ubasis_raw[l]
+        if basis_l:
+            es = numpy.array(ubasis_exp[l])
+            # Remove duplicated primitive basis functions
+            es, e_idx = numpy.unique(es.round(9), True)
+            # from large exponent to small exponent
+            for i in reversed(e_idx):
+                ubasis.append(basis_l[i])
     return ubasis
 uncontract = uncontracted_basis
 contract = contracted_basis = basis.to_general_contraction
@@ -1029,8 +1053,6 @@ def dumps(mol):
     try:
         return json.dumps(moldic)
     except TypeError:
-        import warnings
-
         def skip_value(dic):
             dic1 = {}
             for k,v in dic.items():
@@ -2070,6 +2092,8 @@ class Mole(lib.StreamObject):
         self._symm_orig = None
         self._symm_axes = None
         self._nelectron = None
+        self._nao = None
+        self._enuc = None
         self._atom = []
         self._basis = {}
         self._ecp = {}
@@ -2339,39 +2363,7 @@ class Mole(lib.StreamObject):
             self.nelec
 
         if self.symmetry:
-            from pyscf import symm
-            self.topgroup, orig, axes = symm.detect_symm(self._atom, self._basis)
-
-            if isinstance(self.symmetry, (str, unicode)):
-                self.symmetry = str(symm.std_symb(self.symmetry))
-                self.groupname, axes = symm.subgroup(self.symmetry, axes)
-                prop_atoms = self.format_atom(self._atom, orig, axes, 'Bohr')
-                if symm.check_given_symm(self.groupname, prop_atoms, self._basis):
-                    self.topgroup = self.symmetry
-                else:
-                    raise RuntimeWarning('Unable to identify input symmetry %s.\n'
-                                         'Try symmetry="%s" with geometry (unit="Bohr")\n%s' %
-                                         (self.symmetry, self.topgroup,
-                                          '\n'.join([str(a) for a in prop_atoms])))
-            else:
-                self.groupname, axes = symm.as_subgroup(self.topgroup, axes,
-                                                        self.symmetry_subgroup)
-            self._symm_orig = orig
-            self._symm_axes = axes
-
-            if self.cart and self.groupname in ('Dooh', 'Coov'):
-                if self.groupname == 'Dooh':
-                    self.groupname, lgroup = 'D2h', 'Dooh'
-                else:
-                    self.groupname, lgroup = 'C2v', 'Coov'
-                logger.warn(self, 'This version does not support linear molecule '
-                            'symmetry %s for cartesian GTO basis.  Its subgroup '
-                            '%s is used', lgroup, self.groupname)
-
-            self.symm_orb, self.irrep_id = \
-                    symm.symm_adapted_basis(self, self.groupname, orig, axes)
-            self.irrep_name = [symm.irrep_id2name(self.groupname, ir)
-                               for ir in self.irrep_id]
+            self._build_symmetry()
 
         if dump_input and not self._built and self.verbose > logger.NOTE:
             self.dump_input()
@@ -2384,6 +2376,46 @@ class Mole(lib.StreamObject):
         self._built = True
         return self
     kernel = build
+
+    def _build_symmetry(self):
+        '''
+        Update symmetry related attributes: topgroup, groupname, _symm_orig,
+        _symm_axes, irrep_id, irrep_name, symm_orb
+        '''
+        from pyscf import symm
+        self.topgroup, orig, axes = symm.detect_symm(self._atom, self._basis)
+
+        if isinstance(self.symmetry, (str, unicode)):
+            self.symmetry = str(symm.std_symb(self.symmetry))
+            self.groupname, axes = symm.subgroup(self.symmetry, axes)
+            prop_atoms = self.format_atom(self._atom, orig, axes, 'Bohr')
+            if symm.check_given_symm(self.groupname, prop_atoms, self._basis):
+                self.topgroup = self.symmetry
+            else:
+                raise RuntimeWarning('Unable to identify input symmetry %s.\n'
+                                     'Try symmetry="%s" with geometry (unit="Bohr")\n%s' %
+                                     (self.symmetry, self.topgroup,
+                                      '\n'.join([str(a) for a in prop_atoms])))
+        else:
+            self.groupname, axes = symm.as_subgroup(self.topgroup, axes,
+                                                    self.symmetry_subgroup)
+        self._symm_orig = orig
+        self._symm_axes = axes
+
+        if self.cart and self.groupname in ('Dooh', 'Coov', 'SO3'):
+            if self.groupname == 'Coov':
+                self.groupname, lgroup = 'C2v', self.groupname
+            else:
+                self.groupname, lgroup = 'D2h', self.groupname
+            logger.warn(self, 'This version does not support symmetry %s '
+                        'for cartesian GTO basis. Its subgroup %s is used',
+                        lgroup, self.groupname)
+
+        self.symm_orb, self.irrep_id = \
+                symm.symm_adapted_basis(self, self.groupname, orig, axes)
+        self.irrep_name = [symm.irrep_id2name(self.groupname, ir)
+                           for ir in self.irrep_id]
+        return self
 
     @lib.with_doc(format_atom.__doc__)
     def format_atom(self, atom, origin=0, axes=None, unit='Ang'):
@@ -3096,7 +3128,16 @@ class Mole(lib.StreamObject):
     ao_loc_nr = ao_loc_nr
     ao_loc_2c = ao_loc_2c
 
-    nao = property(nao_nr)
+    @property
+    def nao(self):
+        if self._nao is None:
+            return self.nao_nr()
+        else:
+            return self._nao
+    @nao.setter
+    def nao(self, x):
+        self._nao = x
+
     ao_loc = property(ao_loc_nr)
 
     tmap = time_reversal_map = time_reversal_map
