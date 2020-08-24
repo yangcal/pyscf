@@ -715,7 +715,7 @@ def eaccsd_star_contract(eom, eaccsd_evals, eaccsd_evecs, leaccsd_evecs, kshift,
         # Transposing the l2 operator
         l2T = np.zeros_like(l2)
         for kj, ka in itertools.product(range(nkpts), repeat=2):
-            kb = kconserv[ka,kj,kshift]
+            kb = kconserv[kj,ka,kshift]
             l2T[kj,kb] = l2[kj,ka].transpose(0,2,1)
         l2 = (l2 + 2.*l2T)/3.
 
@@ -975,8 +975,8 @@ def eeccsd_matvec(eom, vector, kshift, imds=None, diag=None):
 
 def eeccsd_matvec_singlet(eom, vector, kshift, imds=None, diag=None):
     """Spin-restricted, k-point EOM-EE-CCSD equations for singlet excitation only.
-    
-    This implementation can be checked against the spin-orbital version in 
+
+    This implementation can be checked against the spin-orbital version in
     `eom_kccsd_ghf.eeccsd_matvec()`.
     """
     cput0 = (time.clock(), time.time())

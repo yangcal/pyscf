@@ -1016,7 +1016,7 @@ def eaccsd_diag(eom, kshift, imds=None):
             for ka in range(nkpts):
                 kb = kconserv[kshift,ka,kj]
                 Hr2[kj,ka] -= foo[kj].diagonal()[:,None,None]
-                Hr2[kj,ka] -= fvv[ka].diagonal()[None,:,None]
+                Hr2[kj,ka] += fvv[ka].diagonal()[None,:,None]
                 Hr2[kj,ka] += fvv[kb].diagonal()[None,None,:]
     else:
         for kj in range(nkpts):
@@ -1033,7 +1033,6 @@ def eaccsd_diag(eom, kshift, imds=None):
                     Hr2[kj,ka] += np.einsum('abab->ab', imds.Wvvvv[ka,kb,ka])[None,:,:]
 
                 Hr2[kj,ka] -= np.einsum('kjab,kjab->jab',imds.Woovv[kshift,kj,ka],imds.t2[kshift,kj,ka])
-
     vector = amplitudes_to_vector_ea(Hr1, Hr2, kshift, kconserv)
     return vector
 
