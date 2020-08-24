@@ -341,6 +341,8 @@ class _PhysicistsERIs:
             if not np.any(orbspin == -1):
                 self.orbspin = orbspin[mo_idx]
                 mo_coeff = lib.tag_array(mo_coeff, orbspin=self.orbspin)
+            else:
+                self.orbspin = orbspin[mo_idx]
         self.mo_coeff = mo_coeff
 
         # Note: Recomputed fock matrix since SCF may not be fully converged.
