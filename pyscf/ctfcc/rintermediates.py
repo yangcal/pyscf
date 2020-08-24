@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014-2020 The PySCF Developers. All Rights Reserved.
+# Copyright 2014-2019 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,180 +12,131 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Author: Yang Gao <younggao1994@gmail.com>
-#         Qiming Sun <osirpt.sun@gmail.com>
 
-from symtensor.sym_ctf import einsum
+import itertools
+import numpy as np
+import time
+from pyscf.lib import logger
+from pyscf.pbc.mp.kmp2 import padding_k_idx
+from pyscf.pbc.lib import kpts_helper
+from pyscf.pbc.cc.kccsd_t_rhf  import _get_epqr
+from symtensor.ctf import zeros, einsum, frombatchfunc
+from symtensor.ctf.backend import asarray
 
-# This is restricted (R)CCSD
-# Ref: Hirata et al., J. Chem. Phys. 120, 2581 (2004)
+def get_t3p2_imds_slow(cc, t1, t2, eris=None):
+    cpu0 = (time.clock(), time.time())
+    if eris is None:
+        eris = cc.ao2mo()
 
-### Eqs. (37)-(39) "kappa"
+    kpts=  cc.kpts
+    nocc, nvir = t1.shape
+    nkpts = cc.nkpts
+    dtype = np.result_type(t1, t2)
 
-def cc_Foo(t1, t2, eris):
-    Fki  = 2*einsum('kcld,ilcd->ki', eris.ovov, t2)
-    Fki -= einsum('kdlc,ilcd->ki', eris.ovov, t2)
-    tmp  = einsum('kcld,ld->kc', eris.ovov, t1)
-    Fki += 2*einsum('kc,ic->ki', tmp, t1)
-    tmp  = einsum('kdlc,ld->kc', eris.ovov, t1)
-    Fki -= einsum('kc,ic->ki', tmp, t1)
-    Fki += eris.foo
-    return Fki
+    fov = eris.fov
+    mo_e_o = np.array([eris.mo_energy[ki][:nocc] for ki in range(nkpts)])
+    mo_e_v = np.array([eris.mo_energy[ki][nocc:] for ki in range(nkpts)])
 
-def cc_Fvv(t1, t2, eris):
-    Fac  =-2*einsum('kcld,klad->ac', eris.ovov, t2)
-    Fac +=   einsum('kdlc,klad->ac', eris.ovov, t2)
-    tmp  =   einsum('kcld,ld->kc', eris.ovov, t1)
-    Fac -= 2*einsum('kc,ka->ac', tmp, t1)
-    tmp  =   einsum('kdlc,ld->kc', eris.ovov, t1)
-    Fac +=   einsum('kc,ka->ac', tmp, t1)
-    Fac +=   eris.fvv
-    return Fac
+    # Get location of padded elements in occupied and virtual space
+    nonzero_opadding, nonzero_vpadding = padding_k_idx(cc, kind="split")
+    ccsd_energy = cc.energy(t1, t2, eris)
 
-def cc_Fov(t1, t2, eris):
-    Fkc  = 2*einsum('kcld,ld->kc', eris.ovov, t1)
-    Fkc -=   einsum('kdlc,ld->kc', eris.ovov, t1)
-    Fkc +=   eris.fov
-    return Fkc
+    Soovv = 2 * eris.ovov.transpose(0,2,1,3) - eris.ovov.transpose(0,2,3,1)
+    ooov = eris.ooov.transpose(0,2,1,3).conj()
+    ovvv = eris.ovvv.conj()
 
-### Eqs. (40)-(41) "lambda"
+    def get_w(ki, kj, kk):
+        ovvv_tmp  = ovvv[ki]
+        t2_tmp = t2[kk,kj]
+        w = einsum('iafb,kjcf->ijkabc', ovvv_tmp, t2_tmp)
+        ooov_tmp = ooov[kj,ki]
+        t2_tmp = t2[:,kk]
+        w -= einsum('jima,mkbc->ijkabc', ooov_tmp, t2_tmp)
+        return w
 
-def Loo(t1, t2, eris):
-    Lki = cc_Foo(t1, t2, eris) + einsum('kc,ic->ki',eris.fov, t1)
-    Lki += 2*einsum('kilc,lc->ki', eris.ooov, t1)
-    Lki -=   einsum('likc,lc->ki', eris.ooov, t1)
-    return Lki
+    def get_eijkabc(ki,kj,kk):
+        eijk = _get_epqr([0,nocc,ki,mo_e_o,nonzero_opadding],
+                         [0,nocc,kj,mo_e_o,nonzero_opadding],
+                         [0,nocc,kk,mo_e_o,nonzero_opadding])
+        eijk = asarray(eijk)
+        def _get_abc(ka,kb):
+            kc = kpts_helper.get_kconserv3(cc._scf.cell, kpts, [ki,kj,kk,ka,kb])
+            eabc = _get_epqr([0,nvir,ka,mo_e_v,nonzero_vpadding],
+                             [0,nvir,kb,mo_e_v,nonzero_vpadding],
+                             [0,nvir,kc,mo_e_v,nonzero_vpadding])
+            ind = (ka*nkpts+kb)*eabc.size +np.arange(eabc.size)
+            return ind, eabc.ravel()
+        all_tasks = [[ka,kb] for ka,kb in itertools.product(range(nkpts), repeat=2)]
+        shape = (nkpts,nkpts,nvir,nvir,nvir)
+        eabc = frombatchfunc(_get_abc, shape, all_tasks).array
+        eijkabc = eijk.reshape(1,1,nocc,nocc,nocc,1,1,1) -\
+                  eabc.reshape(nkpts,nkpts,1,1,1,nvir,nvir,nvir)
+        return eijkabc
 
-def Lvv(t1, t2, eris):
-    Lac = cc_Fvv(t1, t2, eris) - einsum('kc,ka->ac', eris.fov, t1)
-    Lac += 2*einsum('kdac,kd->ac', eris.ovvv, t1)
-    Lac -=   einsum('kcad,kd->ac', eris.ovvv, t1)
-    return Lac
+    pt1 = zeros([nocc,nvir], sym=t1.sym, dtype=dtype)
+    pt2 = zeros([nocc,nocc,nvir,nvir], sym=t2.sym, dtype=dtype)
+    Woovo = zeros([nocc,nocc,nvir,nocc], sym=cc.gen_sym("++--"), dtype=dtype)
+    Wovvv = zeros([nocc,nvir,nvir,nvir], sym=cc.gen_sym("++--"), dtype=dtype)
 
-### Eqs. (42)-(45) "chi"
+    for ki in range(nkpts):
+        pt1tmp = zeros([nocc,nvir], dtype=dtype)
+        pt2tmp_ja = zeros([nkpts,nkpts,nocc,nocc,nvir,nvir], dtype=dtype)
+        Wovvvtmp = zeros([nkpts,nkpts,nocc,nvir,nvir,nvir], dtype=dtype)
+        for kj in range(nkpts):
+            pt2tmp_a = zeros([nkpts,nocc,nocc,nvir,nvir], dtype=dtype)
+            Woovotmp = zeros([nkpts,nocc,nocc,nvir,nocc], dtype=dtype)
+            for kk in range(nkpts):
+                tmp_t3  = get_w(ki, kj, kk)
+                tmp_t3 += get_w(ki, kk, kj).transpose(0, 2, 1, 3, 5, 4)
+                tmp_t3 += get_w(kj, ki, kk).transpose(1, 0, 2, 4, 3, 5)
+                tmp_t3 += get_w(kj, kk, ki).transpose(2, 0, 1, 5, 3, 4)
+                tmp_t3 += get_w(kk, ki, kj).transpose(1, 2, 0, 4, 5, 3)
+                tmp_t3 += get_w(kk, kj, ki).transpose(2, 1, 0, 5, 4, 3)
+                d3 = get_eijkabc(ki,kj,kk)
+                tmp_t3 /= d3
 
-def cc_Woooo(t1, t2, eris):
-    Wklij = einsum('kilc,jc->klij', eris.ooov, t1)
-    Wklij += einsum('ljkc,ic->klij', eris.ooov, t1)
-    Wklij += einsum('kcld,ijcd->klij', eris.ovov, t2)
-    tmp    = einsum('kcld,ic->kild', eris.ovov, t1)
-    Wklij += einsum('kild,jd->klij', tmp, t1)
-    Wklij += eris.oooo.transpose(0,2,1,3)
-    return Wklij
+                St3 = tmp_t3 - tmp_t3.transpose(0,1,2,4,3,5)
+                pt1tmp += einsum('Emnef,Eimnaef->ia', Soovv[kj,kk], St3[ki])
 
-def cc_Wvvvv(t1, t2, eris):
-    Wabcd  = einsum('kdac,kb->abcd', eris.ovvv,-t1)
-    Wabcd -= einsum('kcbd,ka->abcd', eris.ovvv, t1)
-    Wabcd += eris.vvvv.transpose(0,2,1,3)
-    return Wabcd
+                ooov_tmp = eris.ooov[kj,:,kk]
+                pt2tmp_ja -= 2*einsum('imnabe,mjne->ijab', tmp_t3, ooov_tmp)
+                pt2tmp_ja += einsum('inmaeb,njme->ijab', tmp_t3, ooov_tmp)
+                pt2tmp_ja += einsum('imneba,mjne->ijab', tmp_t3, ooov_tmp)
 
-def cc_Wvoov(t1, t2, eris):
-    Wakic  = einsum('kcad,id->akic', eris.ovvv, t1)
-    Wakic -= einsum('likc,la->akic', eris.ooov, t1)
-    Wakic += eris.ovvo.transpose(2,0,3,1)
+                tmp_t3t = tmp_t3.transpose(0,1,2,3,5,4)
 
-    Wakic -= 0.5*einsum('ldkc,ilda->akic', eris.ovov, t2)
-    Wakic -= 0.5*einsum('lckd,ilad->akic', eris.ovov, t2)
-    tmp    = einsum('ldkc,id->likc', eris.ovov, t1)
-    Wakic -= einsum('likc,la->akic', tmp, t1)
-    Wakic += einsum('ldkc,ilad->akic', eris.ovov, t2)
-    return Wakic
+                pt2tmp_a += einsum('Aijmaeb,me->Aijab', tmp_t3t[:,kk],fov[kk])
+                pt2tmp_a -= einsum('Aijmaeb,me->Aijab', tmp_t3[:,kk],fov[kk])
 
-def cc_Wvovo(t1, t2, eris):
-    Wakci  = einsum('kdac,id->akci', eris.ovvv, t1)
-    Wakci -= einsum('kilc,la->akci', eris.ooov, t1)
-    Wakci += eris.oovv.transpose(2,0,3,1)
-    Wakci -= 0.5*einsum('lckd,ilda->akci', eris.ovov, t2)
-    tmp    = einsum('lckd,la->ackd', eris.ovov, t1)
-    Wakci -= einsum('ackd,id->akci', tmp, t1)
-    return Wakci
+                ovvv_tmp = eris.ovvv[kk]
+                pt2tmp_a += 2*einsum('ijmaef,mfbe->ijab',tmp_t3, ovvv_tmp)
+                pt2tmp_a -= einsum('ijmaef,mebf->ijab',tmp_t3, ovvv_tmp)
+                pt2tmp_a -= einsum('ijmfea,mfbe->ijab',tmp_t3, ovvv_tmp)
 
-def Wooov(t1, t2, eris):
-    Wklid  = einsum('ic,kcld->klid', t1, eris.ovov)
-    Wklid += eris.ooov.transpose(0,2,1,3)
-    return Wklid
+                ovov_tmp  =eris.ovov[:,:,kk]
+                Woovotmp += 2. * einsum('ijkabc,makc->jibm', tmp_t3, ovov_tmp)
+                Woovotmp -= einsum('ijkacb,makc->jibm', tmp_t3, ovov_tmp)
+                Woovotmp -= einsum('ijkcba,makc->jibm', tmp_t3, ovov_tmp)
 
-def Wvovv(t1, t2, eris):
-    Walcd  = einsum('ka,kcld->alcd',-t1, eris.ovov)
-    Walcd += eris.ovvv.transpose(2,0,3,1)
-    return Walcd
+                ovov_tmp = eris.ovov[kj,:,kk]
+                Wovvvtmp -= 2. * einsum('ijkabc,jbke->ieac', tmp_t3, ovov_tmp)
+                Wovvvtmp +=      einsum('ijkbac,jbke->ieac', tmp_t3, ovov_tmp)
+                Wovvvtmp +=      einsum('ijkacb,jbke->ieac', tmp_t3, ovov_tmp)
 
-def W1ovvo(t1, t2, eris):
-    Wkaci  = 2*einsum('kcld,ilad->kaci', eris.ovov, t2)
-    Wkaci +=  -einsum('kcld,liad->kaci', eris.ovov, t2)
-    Wkaci +=  -einsum('kdlc,ilad->kaci', eris.ovov, t2)
-    Wkaci += eris.ovvo.transpose(0,2,1,3)
-    return Wkaci
+            Woovo.array[kj,ki] = Woovotmp.array
+            pt2.array[ki,kj] = pt2tmp_a.array
 
-def W2ovvo(t1, t2, eris):
-    Wkaci = einsum('la,lkic->kaci',-t1, Wooov(t1, t2, eris))
-    Wkaci += einsum('kcad,id->kaci', eris.ovvv, t1)
-    return Wkaci
+        Wovvv.array[ki] = Wovvvtmp.array
+        pt1.array[ki] = pt1tmp.array
+        pt2.array[ki] = pt2.array[ki] + pt2tmp_ja.array
 
-def Wovvo(t1, t2, eris):
-    Wkaci = W1ovvo(t1, t2, eris) + W2ovvo(t1, t2, eris)
-    return Wkaci
+    pt2 += pt2.transpose(1,0,3,2)
+    pt1  = pt1/eris.eia + t1
+    pt2  = pt2/eris.eijab + t2
 
-def W1ovov(t1, t2, eris):
-    Wkbid = -einsum('kcld,ilcb->kbid', eris.ovov, t2)
-    Wkbid += eris.oovv.transpose(0,2,1,3)
-    return Wkbid
-
-def W2ovov(t1, t2, eris):
-    Wkbid = einsum('klid,lb->kbid', Wooov(t1, t2, eris),- t1)
-    Wkbid += einsum('kcbd,ic->kbid', eris.ovvv, t1)
-    return Wkbid
-
-def Wovov(t1, t2, eris):
-    return W1ovov(t1, t2, eris) + W2ovov(t1, t2, eris)
-
-def Woooo(t1, t2, eris):
-    Wklij  = einsum('kcld,ijcd->klij', eris.ovov, t2)
-    tmp    = einsum('kcld,ic->kild', eris.ovov, t1)
-    Wklij += einsum('kild,jd->klij', tmp, t1)
-    Wklij += einsum('kild,jd->klij', eris.ooov, t1)
-    Wklij += einsum('ljkc,ic->klij', eris.ooov, t1)
-    Wklij += eris.oooo.transpose(0,2,1,3)
-    return Wklij
-
-def Wvvvv(t1, t2, eris):
-    Wabcd  = einsum('kcld,klab->abcd', eris.ovov, t2)
-    tmp    = einsum('kcld,ka->acld', eris.ovov, t1)
-    Wabcd += einsum('acld,lb->abcd', tmp, t1)
-    Wabcd += eris.vvvv.transpose(0,2,1,3)
-    Wabcd -= einsum('ldac,lb->abcd', eris.ovvv, t1)
-    Wabcd -= einsum('kcbd,ka->abcd', eris.ovvv, t1)
-    return Wabcd
-
-def Wvvvo(t1, t2, eris, Wvvvv=None):
-    Wabcj  =  -einsum('alcj,lb->abcj', W1ovov(t1, t2, eris).transpose(1,0,3,2), t1)
-    Wabcj +=  -einsum('kbcj,ka->abcj', W1ovvo(t1, t2, eris), t1)
-    Wabcj += 2*einsum('ldac,ljdb->abcj', eris.ovvv, t2)
-    Wabcj +=  -einsum('ldac,ljbd->abcj', eris.ovvv, t2)
-    Wabcj +=  -einsum('lcad,ljdb->abcj', eris.ovvv, t2)
-    Wabcj +=  -einsum('kcbd,jkda->abcj', eris.ovvv, t2)
-    Wabcj +=   einsum('ljkc,lkba->abcj', eris.ooov, t2)
-    tmp    =   einsum('ljkc,lb->kcbj', eris.ooov, t1)
-    Wabcj +=   einsum('kcbj,ka->abcj', tmp, t1)
-    Wabcj +=  -einsum('kc,kjab->abcj', cc_Fov(t1, t2, eris), t2)
-    Wabcj += eris.ovvv.transpose(3,1,2,0).conj()
-    if Wvvvv is None:
-        Wvvvv = Wvvvv(t1, t2, eris)
-    Wabcj += einsum('abcd,jd->abcj', Wvvvv, t1)
-    return Wabcj
-
-def Wovoo(t1, t2, eris):
-    Wkbij  =   einsum('kbid,jd->kbij', W1ovov(t1, t2, eris), t1)
-    Wkbij +=  -einsum('klij,lb->kbij', Woooo(t1, t2, eris), t1)
-    Wkbij +=   einsum('kbcj,ic->kbij', W1ovvo(t1, t2, eris), t1)
-    Wkbij += 2*einsum('kild,ljdb->kbij', eris.ooov, t2)
-    Wkbij +=  -einsum('kild,jldb->kbij', eris.ooov, t2)
-    Wkbij +=  -einsum('likd,ljdb->kbij', eris.ooov, t2)
-    Wkbij +=   einsum('kcbd,jidc->kbij', eris.ovvv, t2)
-    tmp    =   einsum('kcbd,ic->kibd', eris.ovvv, t1)
-    Wkbij +=   einsum('kibd,jd->kbij', tmp, t1)
-    Wkbij +=  -einsum('ljkc,libc->kbij', eris.ooov, t2)
-    Wkbij +=   einsum('kc,ijcb->kbij', cc_Fov(t1, t2, eris), t2)
-    Wkbij += eris.ooov.transpose(1,3,0,2).conj()
-    return Wkbij
+    Wmcik = Woovo.transpose(3,2,1,0)
+    Wacek = Wovvv.transpose(3,2,1,0)
+    logger.timer(cc, 'EOM-CCSD(T) imds', *cpu0)
+    delta_ccsd_energy = cc.energy(pt1, pt2, eris) - ccsd_energy
+    logger.info(cc, 'CCSD energy T3[2] correction : %16.12e', delta_ccsd_energy)
+    return delta_ccsd_energy, pt1, pt2, Wmcik, Wacek

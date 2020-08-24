@@ -27,13 +27,14 @@ from pyscf.pbc.df import ft_ao
 from pyscf.pbc.lib.kpts_helper import (is_zero, gamma_point, member, unique,
                                        KPT_DIFF_TOL)
 from pyscf.pbc.df.fft_ao2mo import _format_kpts, _iskconserv
-from pyscf.ctfcc import mpi_helper
+from pyscf.ctfcc import ctf_helper
 
 """
 Parallel GDF. GDF integrals stored in memory as distributed ctf tensors
+This module is ctf-specific
 """
-comm = mpi_helper.comm
-rank = mpi_helper.rank
+comm = ctf_helper.comm
+rank = ctf_helper.rank
 
 def get_member(kpti, kptj, kptij_lst):
     kptij = numpy.vstack((kpti,kptj))
@@ -89,6 +90,70 @@ def from_serial(mydf):
     newdf.j3c = j3c
     return newdf
 
+def _ao2mo_j3c(mydf, mo_coeff, nocc):
+    '''
+    ao2mo on density-fitted j3c integrals
+    returns:
+      ijL,     iaL,     aiL,    abL
+    (ij|L),  (ia|L),  (ai|L), (ab|L)
+    '''
+    from pyscf.ctfcc.integrals import mpigdf
+    nmo = mo_coeff.shape[-1]
+    nvir = nmo - nocc
+    if getattr(mydf, 'j3c', None) is None: mydf.build()
+    kpts = mydf.kpts
+    nkpts = len(kpts)
+    nao, naux = mydf.j3c.shape[2:]
+    ijL = ctf.zeros([nkpts,nkpts,nocc,nocc,naux], dtype=mydf.j3c.dtype)
+    iaL = ctf.zeros([nkpts,nkpts,nocc,nvir,naux], dtype=mydf.j3c.dtype)
+    aiL = ctf.zeros([nkpts,nkpts,nvir,nocc,naux], dtype=mydf.j3c.dtype)
+    abL = ctf.zeros([nkpts,nkpts,nvir,nvir,naux], dtype=mydf.j3c.dtype)
+    jobs = []
+    for ki in range(nkpts):
+        for kj in range(ki,nkpts):
+            jobs.append([ki,kj])
+    tasks, ntasks = ctf_helper.static_partition(jobs)
+    idx_j3c = numpy.arange(nao**2*naux)
+    idx_ooL = numpy.arange(nocc**2*naux)
+    idx_ovL = numpy.arange(nocc*nvir*naux)
+    idx_vvL = numpy.arange(nvir**2*naux)
+    cput1 = cput0 = (time.clock(), time.time())
+    for itask in range(ntasks):
+        if itask >= len(tasks):
+            mydf.j3c.read([])
+            ijL.write([], [])
+            iaL.write([], [])
+            aiL.write([], [])
+            abL.write([], [])
+
+            ijL.write([], [])
+            iaL.write([], [])
+            aiL.write([], [])
+            abL.write([], [])
+            continue
+        ki, kj = tasks[itask]
+        ijid, ijdagger = mpigdf.get_member(kpts[ki], kpts[kj], mydf.kptij_lst)
+        uvL = mydf.j3c.read(ijid*idx_j3c.size+idx_j3c).reshape(nao,nao,naux)
+        if ijdagger: uvL = uvL.transpose(1,0,2).conj()
+        pvL = numpy.einsum("up,uvL->pvL", mo_coeff[ki].conj(), uvL, optimize=True)
+        uvL = None
+        pqL = numpy.einsum('vq,pvL->pqL', mo_coeff[kj], pvL, optimize=True)
+
+        off = ki * nkpts + kj
+        ijL.write(off*idx_ooL.size+idx_ooL, pqL[:nocc,:nocc].ravel())
+        iaL.write(off*idx_ovL.size+idx_ovL, pqL[:nocc,nocc:].ravel())
+        aiL.write(off*idx_ovL.size+idx_ovL, pqL[nocc:,:nocc].ravel())
+        abL.write(off*idx_vvL.size+idx_vvL, pqL[nocc:,nocc:].ravel())
+
+        off = kj * nkpts + ki
+        pqL = pqL.transpose(1,0,2).conj()
+        ijL.write(off*idx_ooL.size+idx_ooL, pqL[:nocc,:nocc].ravel())
+        iaL.write(off*idx_ovL.size+idx_ovL, pqL[:nocc,nocc:].ravel())
+        aiL.write(off*idx_ovL.size+idx_ovL, pqL[nocc:,:nocc].ravel())
+        abL.write(off*idx_vvL.size+idx_vvL, pqL[nocc:,nocc:].ravel())
+
+    return ijL, iaL, aiL, abL
+
 def dump_to_file(mydf, cderi_file=None):
     """
     dump the eri from mpigdf.GDF object to file
@@ -138,7 +203,7 @@ def _make_j3c(mydf, cell, auxcell, kptij_lst):
     fused_cell, fuse = df.df.fuse_auxcell(mydf, auxcell)
     nao, nfao = cell.nao_nr(), fused_cell.nao_nr()
     jobs = numpy.arange(fused_cell.nbas)
-    tasks = list(mpi_helper.static_partition(jobs))
+    tasks, ntasks = ctf_helper.static_partition(jobs)
     ntasks = max(comm.allgather(len(tasks)))
     j3c_junk = ctf.zeros([len(kptij_lst), nao**2, nfao], dtype=numpy.complex128)
     t1 =  t0 = (time.clock(), time.time())
@@ -156,7 +221,7 @@ def _make_j3c(mydf, cell, auxcell, kptij_lst):
         j3c_junk.write(idx, tmp.ravel())
     else:
         j3c_junk.write([],[])
-
+    
     t1 = logger.timer(mydf, 'j3c_junk', *t1)
 
     naux = auxcell.nao_nr()
@@ -173,8 +238,7 @@ def _make_j3c(mydf, cell, auxcell, kptij_lst):
     uniq_kpts, uniq_index, uniq_inverse = unique(kpt_ji)
 
     jobs = numpy.arange(len(uniq_kpts))
-    tasks = list(mpi_helper.static_partition(jobs))
-    ntasks = max(comm.allgather(len(tasks)))
+    tasks, ntasks = ctf_helper.static_partition(jobs)
 
     blksize = max(2048, int(max_memory*.5e6/16/fused_cell.nao_nr()))
     logger.debug2(mydf, 'max_memory %s (MB)  blocksize %s', max_memory, blksize)
@@ -239,8 +303,7 @@ def _make_j3c(mydf, cell, auxcell, kptij_lst):
 
     j3c = ctf.zeros([len(kpt_ji),nao,nao,naux], dtype=numpy.complex128)
     jobs = numpy.arange(len(kpt_ji))
-    tasks = list(mpi_helper.static_partition(jobs))
-    ntasks = max(comm.allgather(len(tasks)))
+    tasks, ntasks = ctf_helper.static_partition(jobs)
 
     for itask in range(ntasks):
         if itask >= len(tasks):
@@ -337,6 +400,7 @@ class GDF(df.GDF):
     dump_to_file = dump_to_file
     from_serial = from_serial
     _make_j3c = _make_j3c
+    _ao2mo_j3c = _ao2mo_j3c
 
 if __name__ == '__main__':
     from pyscf.pbc import gto, scf

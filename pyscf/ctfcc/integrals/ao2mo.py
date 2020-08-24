@@ -18,212 +18,200 @@
 
 '''core module for CC/k-CC ao2mo transformation'''
 import numpy
-import ctf
 import time
 from pyscf import gto, ao2mo, lib
 from pyscf.lib import logger
 from pyscf.ao2mo import _ao2mo
-from pyscf.ctfcc import mpi_helper
-from symtensor.sym_ctf import tensor, einsum
+from symtensor.ctf import einsum, frombatchfunc, array
 import pyscf.pbc.tools.pbc as tools
+import itertools
 
-comm = mpi_helper.comm
-rank = mpi_helper.rank
-size = mpi_helper.size
+def _make_ao_ints(mol, mo_coeff, nocc, shls_slice):
+    nao, nmo = mo_coeff.shape
+    ao_loc = mol.ao_loc_nr()
+    intor = mol._add_suffix('int2e')
+    ao2mopt = _ao2mo.AO2MOpt(mol, intor, 'CVHFnr_schwarz_cond',
+                             'CVHFsetnr_direct_scf')
+    nvir = nmo - nocc
+    sqidx = numpy.arange(nao**2).reshape(nao,nao)
+    ish0, ish1, jsh0, jsh1 = shls_slice
+    i0, i1 = ao_loc[ish0], ao_loc[ish1]
+    j0, j1 = ao_loc[jsh0], ao_loc[jsh1]
+    di = i1 - i0
+    dj = j1 - j0
+    if i0 != j0:
+        eri = gto.moleintor.getints4c(intor, mol._atm, mol._bas, mol._env,
+                                      shls_slice=shls_slice, aosym='s2kl',
+                                      ao_loc=ao_loc, cintopt=ao2mopt._cintopt)
+        eri = _ao2mo.nr_e2(eri.reshape(di*dj,-1), mo_coeff, (0,nmo,0,nmo), 's2kl', 's1')
+        idxij = sqidx[i0:i1,j0:j1].ravel()
 
-def _make_ao_ints(mol, mo_coeff, nocc, dtype):
+        eri = eri.reshape(-1,nmo,nmo)
+        eri_ji = eri.reshape(di,dj,-1).transpose(1,0,2).reshape(-1,nmo,nmo)
+
+        idxji = sqidx[j0:j1,i0:i1].ravel()
+        idxoo_ij = (idxij[:,None] * nocc**2 + numpy.arange(nocc**2)).ravel()
+        idxov_ij = (idxij[:,None] * nocc*nvir + numpy.arange(nocc*nvir)).ravel()
+        idxvv_ij = (idxij[:,None] * nvir**2 + numpy.arange(nvir**2)).ravel()
+
+        idxoo_ji = (idxji[:,None] * nocc**2 + numpy.arange(nocc**2)).ravel()
+        idxov_ji = (idxji[:,None] * nocc*nvir + numpy.arange(nocc*nvir)).ravel()
+        idxvv_ji = (idxji[:,None] * nvir**2 + numpy.arange(nvir**2)).ravel()
+
+        idxoo = numpy.concatenate([idxoo_ij, idxoo_ji])
+        idxov = numpy.concatenate([idxov_ij, idxov_ji])
+        idxvv = numpy.concatenate([idxvv_ij, idxvv_ji])
+
+        ppoo = numpy.concatenate([eri[:,:nocc,:nocc].ravel(), eri_ji[:,:nocc,:nocc].ravel()])
+        ppov = numpy.concatenate([eri[:,:nocc,nocc:].ravel(), eri_ji[:,:nocc,nocc:].ravel()])
+        ppvv = numpy.concatenate([eri[:,nocc:,nocc:].ravel(), eri_ji[:,nocc:,nocc:].ravel()])
+
+    else:
+        eri = gto.moleintor.getints4c(intor, mol._atm, mol._bas, mol._env,
+                                      shls_slice=shls_slice, aosym='s4',
+                                      ao_loc=ao_loc, cintopt=ao2mopt._cintopt)
+        eri = _ao2mo.nr_e2(eri, mo_coeff, (0,nmo,0,nmo), 's4', 's1')
+
+        idx = sqidx[i0:i1,j0:j1].ravel()
+
+        idxoo = (idx[:,None] * nocc**2 + numpy.arange(nocc**2)).ravel()
+        idxov = (idx[:,None] * nocc*nvir + numpy.arange(nocc*nvir)).ravel()
+        idxvv = (idx[:,None] * nvir**2 + numpy.arange(nvir**2)).ravel()
+
+        eri = lib.unpack_tril(eri, axis=0).reshape(-1,nmo,nmo)
+        ppoo = eri[:,:nocc,:nocc].ravel()
+        ppov = eri[:,:nocc,nocc:].ravel()
+        ppvv = eri[:,nocc:,nocc:].ravel()
+
+    return (idxoo, idxov, idxvv), (ppoo, ppov, ppvv)
+
+def make_ao_ints(mol, mo_coeff, nocc):
     '''
-    partial ao2mo transformation, complex mo_coeff not supported
+    partial ao2mo transformation, complex mo_coeff supported
     returns:
       ppoo,     ppov,     ppvv
     (uv|ij),  (uv|ia),  (uv|ab)
     '''
-    NS = ctf.SYM.NS
-    SY = ctf.SYM.SY
-
     ao_loc = mol.ao_loc_nr()
     mo = numpy.asarray(mo_coeff, order='F')
     nao, nmo = mo.shape
     nvir = nmo - nocc
-
-    ppoo = ctf.tensor((nao,nao,nocc,nocc), sym=[SY,NS,NS,NS], dtype=dtype)
-    ppov = ctf.tensor((nao,nao,nocc,nvir), sym=[SY,NS,NS,NS], dtype=dtype)
-    ppvv = ctf.tensor((nao,nao,nvir,nvir), sym=[SY,NS,SY,NS], dtype=dtype)
-    intor = mol._add_suffix('int2e')
-    ao2mopt = _ao2mo.AO2MOpt(mol, intor, 'CVHFnr_schwarz_cond',
-                             'CVHFsetnr_direct_scf')
-    blksize = int(max(4, min(nao/3, nao/size**.5, 2000e6/8/nao**3)))
+    dtype = mo.dtype
+    blksize = int(max(4, min(nao/3, 2000e6/8/nao**3)))
     sh_ranges = ao2mo.outcore.balance_partition(ao_loc, blksize)
     tasks = []
     for k, (ish0, ish1, di) in enumerate(sh_ranges):
         for jsh0, jsh1, dj in sh_ranges[:k+1]:
             tasks.append((ish0,ish1,jsh0,jsh1))
 
-    sqidx = numpy.arange(nao**2).reshape(nao,nao)
-    trilidx = sqidx[numpy.tril_indices(nao)]
-    vsqidx = numpy.arange(nvir**2).reshape(nvir,nvir)
-    vtrilidx = vsqidx[numpy.tril_indices(nvir)]
+    shape_list = [(nao,nao,nocc,nocc),\
+                  (nao,nao,nocc,nvir),\
+                  (nao,nao,nvir,nvir)]
 
-    subtasks = list(mpi_helper.static_partition(tasks))
-    ntasks = max(comm.allgather(len(subtasks)))
-    for itask in range(ntasks):
-        if itask >= len(subtasks):
-            ppoo.write([], [])
-            ppov.write([], [])
-            ppvv.write([], [])
-            continue
+    make_ao_eri = lambda *shls_slice: _make_ao_ints(mol, mo, nocc, shls_slice)
+    ppoo, ppov, ppvv  = frombatchfunc(make_ao_eri, shape_list, tasks, dtype=dtype, nout=3)
+    return ppoo.array, ppov.array, ppvv.array
 
-        shls_slice = subtasks[itask]
-        ish0, ish1, jsh0, jsh1 = shls_slice
-        i0, i1 = ao_loc[ish0], ao_loc[ish1]
-        j0, j1 = ao_loc[jsh0], ao_loc[jsh1]
-        di = i1 - i0
-        dj = j1 - j0
-        if i0 != j0:
-            eri = gto.moleintor.getints4c(intor, mol._atm, mol._bas, mol._env,
-                                          shls_slice=shls_slice, aosym='s2kl',
-                                          ao_loc=ao_loc, cintopt=ao2mopt._cintopt)
-            idx = sqidx[i0:i1,j0:j1].ravel()
+def _make_fftdf_j3c(mydf, ki, kj, mo_a, mo_b):
+    cell = mydf.cell
+    nao = cell.nao_nr()
+    coords = cell.gen_uniform_grids(mydf.mesh)
+    if mo_a.shape==mo_b.shape:
+        RESTRICTED = numpy.linalg.norm(mo_a-mo_b) < 1e-10
+    else:
+        RESTRICTED = False
+    ngrids = len(coords)
+    nmoa, nmob = mo_a.shape[-1], mo_b.shape[-1]
 
-            eri = _ao2mo.nr_e2(eri.reshape(di*dj,-1), mo, (0,nmo,0,nmo), 's2kl', 's1')
-        else:
-            eri = gto.moleintor.getints4c(intor, mol._atm, mol._bas, mol._env,
-                                          shls_slice=shls_slice, aosym='s4',
-                                          ao_loc=ao_loc, cintopt=ao2mopt._cintopt)
-            eri = _ao2mo.nr_e2(eri, mo, (0,nmo,0,nmo), 's4', 's1')
-            idx = sqidx[i0:i1,j0:j1][numpy.tril_indices(i1-i0)]
+    idx_ppG = numpy.arange(nmoa**2*ngrids)
+    idx_ppR = numpy.arange(nmob**2*ngrids)
 
-        ooidx = idx[:,None] * nocc**2 + numpy.arange(nocc**2)
-        ovidx = idx[:,None] * (nocc*nvir) + numpy.arange(nocc*nvir)
-        vvidx = idx[:,None] * nvir**2 + vtrilidx
-        eri = eri.reshape(-1,nmo,nmo)
-        ppoo.write(ooidx.ravel(), eri[:,:nocc,:nocc].ravel())
-        ppov.write(ovidx.ravel(), eri[:,:nocc,nocc:].ravel())
-        ppvv.write(vvidx.ravel(), lib.pack_tril(eri[:,nocc:,nocc:]).ravel())
-        idx = eri = None
-    return ppoo, ppov, ppvv
+    kpts = mydf.kpts
+    nkpts = len(kpts)
+    kpti, kptj = kpts[ki], kpts[kj]
+    ao_kpti = mydf._numint.eval_ao(cell, coords, kpti)[0]
+    ao_kptj = mydf._numint.eval_ao(cell, coords, kptj)[0]
+    q = kptj - kpti
+    coulG = tools.get_coulG(cell, q, mesh=mydf.mesh)
+    wcoulG = coulG * (cell.vol/ngrids)
+    fac = numpy.exp(-1j * numpy.dot(coords, q))
+    mo_kpti_b = numpy.dot(ao_kpti, mo_b[ki]).T
+    mo_kptj_b = numpy.dot(ao_kptj, mo_b[kj]).T
+    mo_pairs_b = numpy.einsum('ig,jg->ijg', mo_kpti_b.conj(), mo_kptj_b)
+
+    if RESTRICTED:
+        mo_pairs_a = mo_pairs_b
+    else:
+        mo_kpti_a = numpy.dot(ao_kpti, mo_a[ki]).T
+        mo_kptj_a = numpy.dot(ao_kptj, mo_a[kj]).T
+        mo_pairs_a = numpy.einsum('ig,jg->ijg', mo_kpti_a.conj(), mo_kptj_a)
+
+    mo_pairs_G = tools.fft(mo_pairs_a.reshape(-1,ngrids)*fac, mydf.mesh)
+
+    if ki==kj:
+        ind_ppR  = (ki*nkpts+kj)*idx_ppR.size+idx_ppR
+        val_ppR = mo_pairs_b.ravel()
+    else:
+        ind_ppR = numpy.concatenate([(ki*nkpts+kj)*idx_ppR.size+idx_ppR,\
+                                     (kj*nkpts+ki)*idx_ppR.size+idx_ppR])
+        val_ppR = numpy.concatenate([mo_pairs_b.ravel(),\
+                                     mo_pairs_b.transpose(1,0,2).conj().ravel()])
+
+    mo_pairs_a = mo_pairs_b = None
+    mo_pairs_G*= wcoulG
+
+    v = tools.ifft(mo_pairs_G, mydf.mesh)
+    v *= fac.conj()
+    v = v.reshape(nmoa,nmoa,ngrids)
+
+    if ki==kj:
+        ind_ppG = (ki*nkpts+kj)*idx_ppG.size+idx_ppG
+        val_ppG = v.ravel()
+    else:
+        ind_ppG = numpy.concatenate([(ki*nkpts+kj)*idx_ppG.size+idx_ppG,\
+                                     (kj*nkpts+ki)*idx_ppG.size+idx_ppG])
+        val_ppG = numpy.concatenate([v.ravel(),\
+                                     v.transpose(1,0,2).conj().ravel()])
+    return (ind_ppG, ind_ppR), (val_ppG, val_ppR)
 
 def _make_fftdf_eris(mycc, mo_a, mo_b, nocca, noccb, out=None):
     mydf = mycc._scf.with_df
     kpts = mycc.kpts
     cell = mydf.cell
     gvec = cell.reciprocal_vectors()
-    nao = cell.nao_nr()
     coords = cell.gen_uniform_grids(mydf.mesh)
     ngrids = len(coords)
     nkpts = len(kpts)
     nmoa, nmob = mo_a.shape[-1], mo_b.shape[-1]
-    nvira, nvirb = nmoa-nocca, nmob-noccb
-    if mo_a.shape==mo_b.shape:
-        RESTRICTED = numpy.linalg.norm(mo_a-mo_b) < 1e-10
-    else:
-        RESTRICTED = False
     cput1 = cput0 = (time.clock(), time.time())
-    ijG = ctf.zeros([nkpts,nkpts,nocca,nocca,ngrids], dtype=numpy.complex128)
-    iaG = ctf.zeros([nkpts,nkpts,nocca,nvira,ngrids], dtype=numpy.complex128)
-    abG = ctf.zeros([nkpts,nkpts,nvira,nvira,ngrids], dtype=numpy.complex128)
+    all_tasks = []
 
-    ijR = ctf.zeros([nkpts,nkpts,noccb,noccb,ngrids], dtype=numpy.complex128)
-    iaR = ctf.zeros([nkpts,nkpts,noccb,nvirb,ngrids], dtype=numpy.complex128)
-    aiR = ctf.zeros([nkpts,nkpts,nvirb,noccb,ngrids], dtype=numpy.complex128)
-    abR = ctf.zeros([nkpts,nkpts,nvirb,nvirb,ngrids], dtype=numpy.complex128)
-
-    jobs = []
     for ki in range(nkpts):
         for kj in range(ki,nkpts):
-            jobs.append([ki,kj])
-    tasks = mpi_helper.static_partition(jobs)
-    ntasks = max(comm.allgather(len(tasks)))
+            all_tasks.append([ki,kj])
 
-    idx_ooG = numpy.arange(nocca*nocca*ngrids)
-    idx_ovG = numpy.arange(nocca*nvira*ngrids)
-    idx_vvG = numpy.arange(nvira*nvira*ngrids)
+    sym1 = ["+-+", [kpts, kpts, kpts[0]-kpts], None, gvec]
+    sym2 = ["+--", [kpts, kpts, kpts[0]-kpts], None, gvec]
+    sym_list  = [sym1, sym2]
 
-    idx_ooR = numpy.arange(noccb*noccb*ngrids)
-    idx_ovR = numpy.arange(noccb*nvirb*ngrids)
-    idx_vvR = numpy.arange(nvirb*nvirb*ngrids)
+    gen_eri  = lambda ki, kj: _make_fftdf_j3c(mydf, ki, kj, mo_a, mo_b)
+    shape_list = [(nmoa, nmoa, ngrids), (nmob, nmob, ngrids)]
 
-    for itask in range(ntasks):
-        if itask >= len(tasks):
-            ijR.write([], [])
-            iaR.write([], [])
-            aiR.write([], [])
-            abR.write([], [])
-            ijR.write([], [])
-            iaR.write([], [])
-            aiR.write([], [])
-            abR.write([], [])
+    ppG, ppR = frombatchfunc(gen_eri, shape_list, all_tasks, \
+                             sym=sym_list, nout=2, dtype=numpy.complex128)
 
-            ijG.write([], [])
-            iaG.write([], [])
-            abG.write([], [])
-            ijG.write([], [])
-            iaG.write([], [])
-            abG.write([], [])
-            continue
-        ki, kj = tasks[itask]
-        kpti, kptj = kpts[ki], kpts[kj]
-        ao_kpti = mydf._numint.eval_ao(cell, coords, kpti)[0]
-        ao_kptj = mydf._numint.eval_ao(cell, coords, kptj)[0]
-        q = kptj - kpti
-        coulG = tools.get_coulG(cell, q, mesh=mydf.mesh)
-        wcoulG = coulG * (cell.vol/ngrids)
-        fac = numpy.exp(-1j * numpy.dot(coords, q))
-        mo_kpti_b = numpy.dot(ao_kpti, mo_b[ki]).T
-        mo_kptj_b = numpy.dot(ao_kptj, mo_b[kj]).T
-        mo_pairs_b = numpy.einsum('ig,jg->ijg', mo_kpti_b.conj(), mo_kptj_b)
-        if RESTRICTED:
-            mo_pairs_a = mo_pairs_b
-        else:
-            mo_kpti_a = numpy.dot(ao_kpti, mo_a[ki]).T
-            mo_kptj_a = numpy.dot(ao_kptj, mo_a[kj]).T
-            mo_pairs_a = numpy.einsum('ig,jg->ijg', mo_kpti_a.conj(), mo_kptj_a)
+    ooG = ppG[:,:,:nocca,:nocca]
+    ovG = ppG[:,:,:nocca,nocca:]
+    vvG = ppG[:,:,nocca:,nocca:]
 
-        mo_pairs_G = tools.fft(mo_pairs_a.reshape(-1,ngrids)*fac, mydf.mesh)
+    del ppG
 
-        off = ki * nkpts + kj
-        ijR.write(off*idx_ooR.size+idx_ooR, mo_pairs_b[:noccb,:noccb].ravel())
-        iaR.write(off*idx_ovR.size+idx_ovR, mo_pairs_b[:noccb,noccb:].ravel())
-        aiR.write(off*idx_ovR.size+idx_ovR, mo_pairs_b[noccb:,:noccb].ravel())
-        abR.write(off*idx_vvR.size+idx_vvR, mo_pairs_b[noccb:,noccb:].ravel())
+    ooR = ppR[:,:,:noccb,:noccb]
+    ovR = ppR[:,:,:noccb,noccb:]
+    voR = ppR[:,:,noccb:,:noccb]
+    vvR = ppR[:,:,noccb:,noccb:]
 
-        off = kj * nkpts + ki
-        mo_pairs_b = mo_pairs_b.transpose(1,0,2).conj()
-        ijR.write(off*idx_ooR.size+idx_ooR, mo_pairs_b[:noccb,:noccb].ravel())
-        iaR.write(off*idx_ovR.size+idx_ovR, mo_pairs_b[:noccb,noccb:].ravel())
-        aiR.write(off*idx_ovR.size+idx_ovR, mo_pairs_b[noccb:,:noccb].ravel())
-        abR.write(off*idx_vvR.size+idx_vvR, mo_pairs_b[noccb:,noccb:].ravel())
-
-        mo_pairs_a = mo_pairs_b = None
-        mo_pairs_G*= wcoulG
-        v = tools.ifft(mo_pairs_G, mydf.mesh)
-        v *= fac.conj()
-        v = v.reshape(nmob,nmob,ngrids)
-
-        off = ki * nkpts + kj
-        ijG.write(off*idx_ooG.size+idx_ooG, v[:nocca,:nocca].ravel())
-        iaG.write(off*idx_ovG.size+idx_ovG, v[:nocca,nocca:].ravel())
-        abG.write(off*idx_vvG.size+idx_vvG, v[nocca:,nocca:].ravel())
-
-        off = kj * nkpts + ki
-        v = v.transpose(1,0,2).conj()
-        ijG.write(off*idx_ooG.size+idx_ooG, v[:nocca,:nocca].ravel())
-        iaG.write(off*idx_ovG.size+idx_ovG, v[:nocca,nocca:].ravel())
-        abG.write(off*idx_vvG.size+idx_vvG, v[nocca:,nocca:].ravel())
-
-    cput1 = logger.timer(mycc, "generating (pq|G)", *cput1)
-    sym1 = ["+-+", [kpts,]*3, None, gvec]
-    sym2 = ["+--", [kpts,]*3, None, gvec]
-
-    ooG = tensor(ijG, sym1, verbose=mycc.SYMVERBOSE)
-    ovG = tensor(iaG, sym1, verbose=mycc.SYMVERBOSE)
-    vvG = tensor(abG, sym1, verbose=mycc.SYMVERBOSE)
-
-    ooR = tensor(ijR, sym2, verbose=mycc.SYMVERBOSE)
-    ovR = tensor(iaR, sym2, verbose=mycc.SYMVERBOSE)
-    voR = tensor(aiR, sym2, verbose=mycc.SYMVERBOSE)
-    vvR = tensor(abR, sym2, verbose=mycc.SYMVERBOSE)
-
+    del ppR
     oooo = einsum('ijg,klg->ijkl', ooG, ooR)/ nkpts
     ooov = einsum('ijg,kag->ijka', ooG, ovR)/ nkpts
     oovv = einsum('ijg,abg->ijab', ooG, vvR)/ nkpts
@@ -234,7 +222,9 @@ def _make_fftdf_eris(mycc, mo_a, mo_b, nocca, noccb, out=None):
     ovvv = einsum('iag,bcg->iabc', ovG, vvR)/ nkpts
     ovG = iaG = None
     vvvv = einsum('abg,cdg->abcd', vvG, vvR)/ nkpts
+
     cput1 = logger.timer(mycc, "(pq|G) to (pq|rs)", *cput1)
+
     if out is None:
         return oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv
     else:
@@ -300,6 +290,7 @@ def make_fftdf_eris_uhf(mycc, eris):
 
 def make_fftdf_eris_ghf(mycc, eris):
     nocc = mycc.nocc
+    nvir = mycc.nmo - nocc
     nkpts = mycc.nkpts
     nao = mycc._scf.cell.nao_nr()
     if getattr(eris.mo_coeff[0], 'orbspin', None) is None:
@@ -316,47 +307,50 @@ def make_fftdf_eris_ghf(mycc, eris):
         mo_a_coeff = numpy.asarray([mo[:nao] + mo[nao:] for mo in eris.mo_coeff])
         oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv = \
                         _make_fftdf_eris(mycc, mo_a_coeff, mo_a_coeff, nocc, nocc)
-        jobs = numpy.arange(nkpts**3)
-        tasks = mpi_helper.static_partition(jobs)
-        ntasks = max(comm.allgather(len(tasks)))
-        def _force_sym(eri, symbols, kp, kq, kr):
-            off = (kp*nkpts**2+kq*nkpts+kr)*numpy.prod(eri.array.shape[3:])
-            pq_size = int(numpy.prod(eri.array.shape[3:5]))
-            rs_size = int(numpy.prod(eri.array.shape[5:]))
-            ks = eris.kconserv[kp,kq,kr]
-            orb =[]
-            for sx, kx in zip(symbols, [kp,kq,kr,ks]):
-                if sx=='o':
-                    orb.append(getattr(eris.mo_coeff[kx], 'orbspin')[:nocc])
-                elif sx=='v':
-                    orb.append(getattr(eris.mo_coeff[kx], 'orbspin')[nocc:])
-                else:
-                    raise ValueError("orbital label %s not recognized " %sx)
-            pqforbid = numpy.asarray(numpy.where((orb[0][:,None] != orb[1]).ravel()), dtype=int)[0]
-            rsforbid = numpy.asarray(numpy.where((orb[2][:,None] != orb[3]).ravel()), dtype=int)[0]
-            idxpq = off + pqforbid[:,None] * rs_size + numpy.arange(rs_size)
-            idxrs = off + numpy.arange(pq_size)[:,None]*rs_size + rsforbid
-            idx = numpy.concatenate((idxpq.ravel(), idxrs.ravel()))
-            eri.write(idx, numpy.zeros(idx.size))
 
-        for itask in range(ntasks):
-            if itask >= len(tasks):
-                oooo.write([],[])
-                ooov.write([],[])
-                oovv.write([],[])
-                ovvo.write([],[])
-                ovov.write([],[])
-                ovvv.write([],[])
-                vvvv.write([],[])
-                continue
-            kp, kq, kr = mpi_helper.unpack_idx(tasks[itask], nkpts, nkpts, nkpts)
-            _force_sym(oooo, 'oooo', kp, kq, kr)
-            _force_sym(ooov, 'ooov', kp, kq, kr)
-            _force_sym(oovv, 'oovv', kp, kq, kr)
-            _force_sym(ovvo, 'ovvo', kp, kq, kr)
-            _force_sym(ovov, 'ovov', kp, kq, kr)
-            _force_sym(ovvv, 'ovvv', kp, kq, kr)
-            _force_sym(vvvv, 'vvvv', kp, kq, kr)
+        all_tasks = [[kp,kq,kr] for kp,kq,kr in itertools.product(range(nkpts), repeat=3)]
+        orb_dic = {"o": nocc, "v":nvir}
+        def _force_sym(kp, kq, kr):
+            ks = eris.kconserv[kp,kq,kr]
+            off = (kp*nkpts**2+kq*nkpts+kr)
+            orb = [getattr(eris.mo_coeff[kx], 'orbspin') for kx in [kp, kq, kr, ks]]
+
+            def get_idx(symbol):
+                offset = off * numpy.prod([orb_dic[i] for i in symbol])
+                pq_size = numpy.prod([orb_dic[i] for i in symbol[:2]])
+                rs_size = numpy.prod([orb_dic[i] for i in symbol[2:]])
+                slice_list = []
+                orb_list = []
+                for ni, i in enumerate(symbol):
+                    if i=='o':
+                        orb_list.append(orb[ni][:nocc])
+                    else:
+                        orb_list.append(orb[ni][nocc:])
+
+                pqforbid = numpy.where((orb_list[0][:,None] != orb_list[1]).ravel())[0]
+                rsforbid = numpy.where((orb_list[2][:,None] != orb_list[3]).ravel())[0]
+
+                idx_pq = offset + pqforbid[:,None] * rs_size + numpy.arange(rs_size)
+                idx_rs = offset + numpy.arange(rs_size)[:,None] * rs_size + rsforbid.ravel()
+                idx=  numpy.concatenate((idx_pq.ravel(), idx_rs.ravel()))
+                val = numpy.zeros(idx.size)
+                return idx, val
+
+            idx_oooo, val_oooo = get_idx('oooo')
+            idx_ooov, val_ooov = get_idx('ooov')
+            idx_oovv, val_oovv = get_idx('oovv')
+            idx_ovvo, val_ovvo = get_idx('ovvo')
+            idx_ovov, val_ovov = get_idx('ovov')
+            idx_ovvv, val_ovvv = get_idx('ovvv')
+            idx_vvvv, val_vvvv = get_idx('vvvv')
+
+            return (idx_oooo, idx_ooov, idx_oovv, idx_ovvo, idx_ovov, idx_ovvv, idx_vvvv),\
+                   (val_oooo, val_ooov, val_oovv, val_ovvo, val_ovov, val_ovvv, val_vvvv)
+
+        out = (oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv)
+        shape_list = [i.shape for i in out]
+        oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv = \
+                    frombatchfunc(_force_sym, shape_list, all_tasks, out=out)
 
     eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(2,0,1,3)
     eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
@@ -368,71 +362,6 @@ def make_fftdf_eris_ghf(mycc, eris):
     eris.ovvo = ovvo.transpose(0,2,1,3) - oovv.transpose(0,2,3,1)
     del oooo, ooov, ovov, oovv, ovvo
 
-def _ao2mo_j3c(mydf, mo_coeff, nocc):
-    '''
-    ao2mo on density-fitted j3c integrals
-    returns:
-      ijL,     iaL,     aiL,    abL
-    (ij|L),  (ia|L),  (ai|L), (ab|L)
-    '''
-    from pyscf.ctfcc.integrals import mpigdf
-    nmo = mo_coeff.shape[-1]
-    nvir = nmo - nocc
-    if getattr(mydf, 'j3c', None) is None: mydf.build()
-    kpts = mydf.kpts
-    nkpts = len(kpts)
-    nao, naux = mydf.j3c.shape[2:]
-    ijL = ctf.zeros([nkpts,nkpts,nocc,nocc,naux], dtype=mydf.j3c.dtype)
-    iaL = ctf.zeros([nkpts,nkpts,nocc,nvir,naux], dtype=mydf.j3c.dtype)
-    aiL = ctf.zeros([nkpts,nkpts,nvir,nocc,naux], dtype=mydf.j3c.dtype)
-    abL = ctf.zeros([nkpts,nkpts,nvir,nvir,naux], dtype=mydf.j3c.dtype)
-    jobs = []
-    for ki in range(nkpts):
-        for kj in range(ki,nkpts):
-            jobs.append([ki,kj])
-    tasks = mpi_helper.static_partition(jobs)
-    ntasks = max(comm.allgather((len(tasks))))
-    idx_j3c = numpy.arange(nao**2*naux)
-    idx_ooL = numpy.arange(nocc**2*naux)
-    idx_ovL = numpy.arange(nocc*nvir*naux)
-    idx_vvL = numpy.arange(nvir**2*naux)
-    cput1 = cput0 = (time.clock(), time.time())
-    for itask in range(ntasks):
-        if itask >= len(tasks):
-            mydf.j3c.read([])
-            ijL.write([], [])
-            iaL.write([], [])
-            aiL.write([], [])
-            abL.write([], [])
-
-            ijL.write([], [])
-            iaL.write([], [])
-            aiL.write([], [])
-            abL.write([], [])
-            continue
-        ki, kj = tasks[itask]
-        ijid, ijdagger = mpigdf.get_member(kpts[ki], kpts[kj], mydf.kptij_lst)
-        uvL = mydf.j3c.read(ijid*idx_j3c.size+idx_j3c).reshape(nao,nao,naux)
-        if ijdagger: uvL = uvL.transpose(1,0,2).conj()
-        pvL = numpy.einsum("up,uvL->pvL", mo_coeff[ki].conj(), uvL, optimize=True)
-        uvL = None
-        pqL = numpy.einsum('vq,pvL->pqL', mo_coeff[kj], pvL, optimize=True)
-
-        off = ki * nkpts + kj
-        ijL.write(off*idx_ooL.size+idx_ooL, pqL[:nocc,:nocc].ravel())
-        iaL.write(off*idx_ovL.size+idx_ovL, pqL[:nocc,nocc:].ravel())
-        aiL.write(off*idx_ovL.size+idx_ovL, pqL[nocc:,:nocc].ravel())
-        abL.write(off*idx_vvL.size+idx_vvL, pqL[nocc:,nocc:].ravel())
-
-        off = kj * nkpts + ki
-        pqL = pqL.transpose(1,0,2).conj()
-        ijL.write(off*idx_ooL.size+idx_ooL, pqL[:nocc,:nocc].ravel())
-        iaL.write(off*idx_ovL.size+idx_ovL, pqL[:nocc,nocc:].ravel())
-        aiL.write(off*idx_ovL.size+idx_ovL, pqL[nocc:,:nocc].ravel())
-        abL.write(off*idx_vvL.size+idx_vvL, pqL[nocc:,nocc:].ravel())
-
-    return ijL, iaL, aiL, abL
-
 def make_df_eris_rhf(mycc, eris):
     mydf = mycc._scf.with_df
     mo_coeff = eris.mo_coeff
@@ -441,20 +370,20 @@ def make_df_eris_rhf(mycc, eris):
     nkpts = len(kpts)
     gvec = mydf.cell.reciprocal_vectors()
     cput1 = (time.clock(), time.time())
-    ijL, iaL, aiL, abL = _ao2mo_j3c(mydf, mo_coeff, nocc)
+    ijL, iaL, aiL, abL = mydf._ao2mo_j3c(mo_coeff, nocc)
     cput1 = logger.timer(mycc, "j3c transformation", *cput1)
-    sym1 = ["+-+", [kpts,]*3, None, gvec]
-    sym2 = ["+--", [kpts,]*3, None, gvec]
+    sym1 = ["+-+", [kpts, kpts, kpts[0]-kpts], None, gvec]
+    sym2 = ["+--", [kpts, kpts, kpts[0]-kpts], None, gvec]
 
-    ooL = tensor(ijL, sym1, verbose=mycc.SYMVERBOSE)
-    ovL = tensor(iaL, sym1, verbose=mycc.SYMVERBOSE)
-    voL = tensor(aiL, sym1, verbose=mycc.SYMVERBOSE)
-    vvL = tensor(abL, sym1, verbose=mycc.SYMVERBOSE)
+    ooL = array(ijL, sym1)
+    ovL = array(iaL, sym1)
+    voL = array(aiL, sym1)
+    vvL = array(abL, sym1)
 
-    ooL2 = tensor(ijL, sym2, verbose=mycc.SYMVERBOSE)
-    ovL2 = tensor(iaL, sym2, verbose=mycc.SYMVERBOSE)
-    voL2 = tensor(aiL, sym2, verbose=mycc.SYMVERBOSE)
-    vvL2 = tensor(abL, sym2, verbose=mycc.SYMVERBOSE)
+    ooL2 = array(ijL, sym2)
+    ovL2 = array(iaL, sym2)
+    voL2 = array(aiL, sym2)
+    vvL2 = array(abL, sym2)
 
     eris.oooo = einsum('ijg,klg->ijkl', ooL, ooL2) / nkpts
     eris.ooov = einsum('ijg,kag->ijka', ooL, ovL2) / nkpts
@@ -474,31 +403,33 @@ def make_df_eris_uhf(mycc, eris):
     nkpts = len(kpts)
     gvec = mydf.cell.reciprocal_vectors()
     cput1 = (time.clock(), time.time())
-    ijL, iaL, aiL, abL = _ao2mo_j3c(mydf, mo_a, nocca)
-    IJL, IAL, AIL, ABL = _ao2mo_j3c(mydf, mo_b, noccb)
+
+    ijL, iaL, aiL, abL = mydf._ao2mo_j3c(mo_a, nocca)
+    IJL, IAL, AIL, ABL = mydf._ao2mo_j3c(mo_b, noccb)
     cput1 = logger.timer(mycc, "(uv|L)->(pq|L)", *cput1)
-    sym1 = ["+-+", [kpts,]*3, None, gvec]
-    sym2 = ["+--", [kpts,]*3, None, gvec]
 
-    ooL = tensor(ijL, sym1, verbose=mycc.SYMVERBOSE)
-    ovL = tensor(iaL, sym1, verbose=mycc.SYMVERBOSE)
-    voL = tensor(aiL, sym1, verbose=mycc.SYMVERBOSE)
-    vvL = tensor(abL, sym1, verbose=mycc.SYMVERBOSE)
+    sym1 = ["+-+", [kpts, kpts, kpts[0]-kpts], None, gvec]
+    sym2 = ["+--", [kpts, kpts, kpts[0]-kpts], None, gvec]
 
-    ooL2 = tensor(ijL, sym2, verbose=mycc.SYMVERBOSE)
-    ovL2 = tensor(iaL, sym2, verbose=mycc.SYMVERBOSE)
-    voL2 = tensor(aiL, sym2, verbose=mycc.SYMVERBOSE)
-    vvL2 = tensor(abL, sym2, verbose=mycc.SYMVERBOSE)
+    ooL = array(ijL, sym1)
+    ovL = array(iaL, sym1)
+    voL = array(aiL, sym1)
+    vvL = array(abL, sym1)
 
-    OOL = tensor(IJL, sym1, verbose=mycc.SYMVERBOSE)
-    OVL = tensor(IAL, sym1, verbose=mycc.SYMVERBOSE)
-    VOL = tensor(AIL, sym1, verbose=mycc.SYMVERBOSE)
-    VVL = tensor(ABL, sym1, verbose=mycc.SYMVERBOSE)
+    ooL2 = array(ijL, sym2)
+    ovL2 = array(iaL, sym2)
+    voL2 = array(aiL, sym2)
+    vvL2 = array(abL, sym2)
 
-    OOL2 = tensor(IJL, sym2, verbose=mycc.SYMVERBOSE)
-    OVL2 = tensor(IAL, sym2, verbose=mycc.SYMVERBOSE)
-    VOL2 = tensor(AIL, sym2, verbose=mycc.SYMVERBOSE)
-    VVL2 = tensor(ABL, sym2, verbose=mycc.SYMVERBOSE)
+    OOL = array(IJL, sym1)
+    OVL = array(IAL, sym1)
+    VOL = array(AIL, sym1)
+    VVL = array(ABL, sym1)
+
+    OOL2 = array(IJL, sym2)
+    OVL2 = array(IAL, sym2)
+    VOL2 = array(AIL, sym2)
+    VVL2 = array(ABL, sym2)
 
     eris.oooo = einsum('ijg,klg->ijkl', ooL, ooL2) / nkpts
     eris.ooov = einsum('ijg,kag->ijka', ooL, ovL2) / nkpts
@@ -543,22 +474,23 @@ def make_df_eris_ghf(mycc, eris):
         mo_a_coeff = numpy.asarray([mo[:nao] for mo in eris.mo_coeff])
         mo_b_coeff = numpy.asarray([mo[nao:] for mo in eris.mo_coeff])
 
-        ijL, iaL, aiL, abL = _ao2mo_j3c(mydf, mo_a_coeff, nocc)
-        IJL, IAL, AIL, ABL = _ao2mo_j3c(mydf, mo_b_coeff, nocc)
+        ijL, iaL, aiL, abL = mydf._ao2mo_j3c(mo_a_coeff, nocc)
+        IJL, IAL, AIL, ABL = mydf._ao2mo_j3c(mo_b_coeff, nocc)
         ijL += IJL
         iaL += IAL
         aiL += AIL
         abL += ABL
         del IJL, IAL, AIL, ABL
-        ooL = tensor(ijL, sym1, verbose=mycc.SYMVERBOSE)
-        ovL = tensor(iaL, sym1, verbose=mycc.SYMVERBOSE)
-        voL = tensor(aiL, sym1, verbose=mycc.SYMVERBOSE)
-        vvL = tensor(abL, sym1, verbose=mycc.SYMVERBOSE)
 
-        ooL2 = tensor(ijL, sym2, verbose=mycc.SYMVERBOSE)
-        ovL2 = tensor(iaL, sym2, verbose=mycc.SYMVERBOSE)
-        voL2 = tensor(aiL, sym2, verbose=mycc.SYMVERBOSE)
-        vvL2 = tensor(abL, sym2, verbose=mycc.SYMVERBOSE)
+        ooL = array(ijL, sym1)
+        ovL = array(iaL, sym1)
+        voL = array(aiL, sym1)
+        vvL = array(abL, sym1)
+
+        ooL2 = array(ijL, sym2)
+        ovL2 = array(iaL, sym2)
+        voL2 = array(aiL, sym2)
+        vvL2 = array(abL, sym2)
 
         oooo = einsum('ijg,klg->ijkl', ooL, ooL2) / nkpts
         ooov = einsum('ijg,klg->ijkl', ooL, ovL2) / nkpts
@@ -567,19 +499,21 @@ def make_df_eris_ghf(mycc, eris):
         ovov = einsum('ijg,klg->ijkl', ovL, ovL2) / nkpts
         ovvv = einsum('ijg,klg->ijkl', ovL, vvL2) / nkpts
         vvvv = einsum('ijg,klg->ijkl', vvL, vvL2) / nkpts
+
         del ooL, ovL, voL, vvL, ooL2, ovL2, voL2, vvL2, ijL, iaL, aiL, abL
     else:
         mo_a_coeff = numpy.asarray([mo[:nao] + mo[nao:] for mo in eris.mo_coeff])
-        ijL, iaL, aiL, abL = _ao2mo_j3c(mydf, mo_a_coeff, nocc)
-        ooL = tensor(ijL, sym1, verbose=mycc.SYMVERBOSE)
-        ovL = tensor(iaL, sym1, verbose=mycc.SYMVERBOSE)
-        voL = tensor(aiL, sym1, verbose=mycc.SYMVERBOSE)
-        vvL = tensor(abL, sym1, verbose=mycc.SYMVERBOSE)
+        ijL, iaL, aiL, abL = mydf._ao2mo_j3c(mo_a_coeff, nocc)
 
-        ooL2 = tensor(ijL, sym2, verbose=mycc.SYMVERBOSE)
-        ovL2 = tensor(iaL, sym2, verbose=mycc.SYMVERBOSE)
-        voL2 = tensor(aiL, sym2, verbose=mycc.SYMVERBOSE)
-        vvL2 = tensor(abL, sym2, verbose=mycc.SYMVERBOSE)
+        ooL = array(ijL, sym1)
+        ovL = array(iaL, sym1)
+        voL = array(aiL, sym1)
+        vvL = array(abL, sym1)
+
+        ooL2 = array(ijL, sym2)
+        ovL2 = array(iaL, sym2)
+        voL2 = array(aiL, sym2)
+        vvL2 = array(abL, sym2)
 
         oooo = einsum('ijg,klg->ijkl', ooL, ooL2) / nkpts
         ooov = einsum('ijg,klg->ijkl', ooL, ovL2) / nkpts
@@ -588,47 +522,50 @@ def make_df_eris_ghf(mycc, eris):
         ovov = einsum('ijg,klg->ijkl', ovL, ovL2) / nkpts
         ovvv = einsum('ijg,klg->ijkl', ovL, vvL2) / nkpts
         vvvv = einsum('ijg,klg->ijkl', vvL, vvL2) / nkpts
-        jobs = numpy.arange(nkpts**3)
-        tasks = mpi_helper.static_partition(jobs)
-        ntasks = max(comm.allgather(len(tasks)))
-        def _force_sym(eri, symbols, kp, kq, kr):
-            off = (kp*nkpts**2+kq*nkpts+kr)*numpy.prod(eri.array.shape[3:])
-            pq_size = int(numpy.prod(eri.array.shape[3:5]))
-            rs_size = int(numpy.prod(eri.array.shape[5:]))
-            ks = eris.kconserv[kp,kq,kr]
-            orb =[]
-            for sx, kx in zip(symbols, [kp,kq,kr,ks]):
-                if sx=='o':
-                    orb.append(getattr(eris.mo_coeff[kx], 'orbspin')[:nocc])
-                elif sx=='v':
-                    orb.append(getattr(eris.mo_coeff[kx], 'orbspin')[nocc:])
-                else:
-                    raise ValueError("orbital label %s not recognized " %sx)
-            pqforbid = numpy.asarray(numpy.where((orb[0][:,None] != orb[1]).ravel()), dtype=int)[0]
-            rsforbid = numpy.asarray(numpy.where((orb[2][:,None] != orb[3]).ravel()), dtype=int)[0]
-            idxpq = off + pqforbid[:,None] * rs_size + numpy.arange(rs_size)
-            idxrs = off + numpy.arange(pq_size)[:,None]*rs_size + rsforbid
-            idx = numpy.concatenate((idxpq.ravel(), idxrs.ravel()))
-            eri.write(idx, numpy.zeros(idx.size))
 
-        for itask in range(ntasks):
-            if itask >= len(tasks):
-                oooo.write([],[])
-                ooov.write([],[])
-                oovv.write([],[])
-                ovvo.write([],[])
-                ovov.write([],[])
-                ovvv.write([],[])
-                vvvv.write([],[])
-                continue
-            kp, kq, kr = mpi_helper.unpack_idx(tasks[itask], nkpts, nkpts, nkpts)
-            _force_sym(oooo, 'oooo', kp, kq, kr)
-            _force_sym(ooov, 'ooov', kp, kq, kr)
-            _force_sym(oovv, 'oovv', kp, kq, kr)
-            _force_sym(ovvo, 'ovvo', kp, kq, kr)
-            _force_sym(ovov, 'ovov', kp, kq, kr)
-            _force_sym(ovvv, 'ovvv', kp, kq, kr)
-            _force_sym(vvvv, 'vvvv', kp, kq, kr)
+        all_tasks = [[kp,kq,kr] for kp,kq,kr in itertools.product(range(nkpts), repeat=3)]
+        orb_dic = {"o": nocc, "v":nvir}
+        def _force_sym(kp, kq, kr):
+            ks = eris.kconserv[kp,kq,kr]
+            off = (kp*nkpts**2+kq*nkpts+kr)
+            orb = [getattr(eris.mo_coeff[kx], 'orbspin') for kx in [kp, kq, kr, ks]]
+            pqidx = numpy.unravel_index(numpy.where((orb[0][:,None] != orb[1]).ravel()), (2*nao,2*nao))
+            rsidx = numpy.unravel_index(numpy.where((orb[2][:,None] != orb[3]).ravel()), (2*nao,2*nao))
+
+            def get_idx(symbol):
+                offset = off * numpy.prod([orb_dic[i] for i in symbol])
+                pq_size = numpy.prod([orb_dic[i] for i in symbol[:2]])
+                rs_size = numpy.prod([orb_dic[i] for i in symbol[2:]])
+                slice_list = []
+                for i in symbol:
+                    if i=='o':
+                        slice_list.append(slice(None,nocc,None))
+                    else:
+                        slice_list.append(slice(nocc,None,None))
+                slice_pq = tuple(slice_list[:2])
+                slice_rs = tuple(slice_list[2:])
+                idx_pq = offset + pqidx[slice_pq].ravel()[:,None] * rs_size + numpy.arange(rs_size)
+                idx_rs = offset + numpy.arange(rs_size)[:,None] * rs_size + rsidx[slice_rs].ravel()
+                idx=  numpy.concatenate((idx_pq, idx_rs))
+                val = numpy.zeros(idx.size)
+                return idx, val
+
+            idx_oooo, val_oooo = get_idx('oooo')
+            idx_ooov, val_ooov = get_idx('ooov')
+            idx_oovv, val_oovv = get_idx('oovv')
+            idx_ovvo, val_ovvo = get_idx('ovvo')
+            idx_ovov, val_ovov = get_idx('ovov')
+            idx_ovvv, val_ovvv = get_idx('ovvv')
+            idx_vvvv, val_vvvv = get_idx('vvvv')
+
+            return (idx_oooo, idx_ooov, idx_oovv, idx_ovvo, idx_ovov, idx_ovvv, idx_vvvv),\
+                   (val_oooo, val_ooov, val_oovv, val_ovvo, val_ovov, val_ovvv, val_vvvv)
+
+        out = (oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv)
+        shape_list = [i.shape for i in out]
+        oooo, ooov, oovv, ovvo, ovov, ovvv, vvvv = \
+                    frombatchfunc(_force_sym, shape_list, all_tasks, out=out)
+
     eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(2,0,1,3)
     eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
     del vvvv, ovvv
