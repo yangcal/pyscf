@@ -425,16 +425,13 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     moa = eris.mo_coeff[0]
     mob = eris.mo_coeff[1]
     cput1 = (time.clock(), time.time())
-
     ppoo, ppov, ppvv = make_ao_ints(eris.mol, moa, nocca)
     cput1 = logger.timer(mycc, 'making ao integrals for alpha', *cput1)
-    ppOO, ppOV, ppVV = make_ao_ints(eris.mol, mob, noccb)
-    cput1 = logger.timer(mycc, 'making ao integrals for beta', *cput1)
+
 
     moa = asarray(moa)
     orba_o, orba_v = moa[:,:nocca], moa[:,nocca:]
-    mob = asarray(mob)
-    orbb_o, orbb_v = mob[:,:noccb], mob[:,noccb:]
+
 
     tmp = einsum('uvmn,ui->ivmn', ppoo, orba_o.conj())
     eris.oooo = einsum('ivmn,vj->ijmn', tmp, orba_o)
@@ -454,6 +451,11 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
 
     del ppoo, ppov, ppvv
 
+    cput1 = (time.clock(), time.time())
+    ppOO, ppOV, ppVV = make_ao_ints(eris.mol, mob, noccb)
+    cput1 = logger.timer(mycc, 'making ao integrals for beta', *cput1)
+    mob = asarray(mob)
+    orbb_o, orbb_v = mob[:,:noccb], mob[:,noccb:]
     tmp = einsum('uvmn,ui->ivmn', ppOO, orbb_o.conj())
     eris.OOOO = einsum('ivmn,vj->ijmn', tmp, orbb_o)
     eris.OOOV = einsum('ivmn,va->mnia', tmp, orbb_v)

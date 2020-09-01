@@ -131,16 +131,7 @@ def update_amps(mycc, t1, t2, eris):
     Ht2ab += einsum('minj,mnab->ijab', WooOO, tauab)
 
     # add_vvvv block
-    Wvvvv, WvvVV, WVVVV = imd.cc_Wvvvv_half(t1, t2, eris)
-    tmp = einsum('acbd,ijcd->ijab', Wvvvv, tauaa) * .5
-    Ht2aa += tmp
-    Ht2aa -= tmp.transpose(0,1,3,2)
-
-    tmp = einsum('acbd,ijcd->ijab', WVVVV, taubb) * .5
-    Ht2bb += tmp
-    Ht2bb -= tmp.transpose(0,1,3,2)
-    Ht2ab += einsum('acbd,ijcd->ijab', WvvVV, tauab)
-    del Wvvvv, WvvVV, WVVVV, tmp, tauaa, tauab, taubb
+    imd.cc_add_vvvv(t1, t2, eris, Ht2aa, Ht2ab, Ht2bb)
 
     Wovvo, WovVO, WOVvo, WOVVO, WoVVo, WOvvO = \
         imd.cc_Wovvo(t1, t2, eris)

@@ -168,6 +168,28 @@ def cc_Wvvvv_half(t1, t2, eris):
     WVVVV-= einsum('mb,fmea->aebf', t1b, eris.VOVV.conj())
     return Wvvvv, WvvVV, WVVVV
 
+def cc_add_vvvv(t1, t2, eris, Ht2aa, Ht2ab, Ht2bb):
+    tauaa, tauab, taubb = make_tau(t2, t1, t1)
+    t1a, t1b = t1
+    Wvvvv = eris.vvvv + einsum('mb,emfa->aebf', t1a, eris.vovv.conj())
+    Wvvvv-= einsum('mb,fmea->aebf', t1a, eris.vovv.conj())
+    tmp = einsum('acbd,ijcd->ijab', Wvvvv, tauaa) * .5
+    Ht2aa += tmp
+    Ht2aa -= tmp.transpose(0,1,3,2)
+    del tmp, Wvvvv
+
+    WVVVV = eris.VVVV + einsum('mb,emfa->aebf', t1b, eris.VOVV.conj())
+    WVVVV-= einsum('mb,fmea->aebf', t1b, eris.VOVV.conj())
+    tmp = einsum('acbd,ijcd->ijab', WVVVV, taubb) * .5
+    Ht2bb += tmp
+    Ht2bb -= tmp.transpose(0,1,3,2)
+    del tmp, WVVVV
+
+    WvvVV = eris.vvVV - einsum('ma,emfb->aebf', t1a, eris.voVV.conj())
+    WvvVV-= einsum('mb,fmea->aebf', t1b, eris.VOvv.conj())
+    Ht2ab += einsum('acbd,ijcd->ijab', WvvVV, tauab)
+
+
 def Wvvvv(t1, t2, eris):
     tauaa, tauab, taubb = make_tau(t2, t1, t1)
     Wvvvv, WvvVV, WVVVV = cc_Wvvvv(t1, t2, eris)
