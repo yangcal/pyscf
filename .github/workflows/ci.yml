@@ -63,7 +63,7 @@ jobs:
       - name: Before Test
         working-directory: ./pyscf
         run: |
-                echo 'pbc_tools_pbc_fft_engine = "NUMPY"' > pyscf_config.py 
+                echo 'pbc_tools_pbc_fft_engine = "NUMPY"' > pyscf_config.py
                 echo "dftd3_DFTD3PATH = './lib/deps/lib'" >> pyscf_config.py
 
       - name: Test
@@ -74,6 +74,7 @@ jobs:
                 --exclude-dir=dmrgscf --exclude-dir=fciqmcscf
                 --exclude-dir=icmpspt --exclude-dir=shciscf --exclude-dir=examples --exclude-dir=nao
                 --exclude-dir=cornell_shci --exclude-dir=pbc/grad
+                --exclude-dir=ctfcc
                 -e test_bz
                 -e h2o_vdz
                 -e test_mc2step_4o4e
@@ -108,4 +109,3 @@ jobs:
         uses: codecov/codecov-action@v1.0.13
         with:
           token: ${{secrets.CODECOV_TOKEN}}
-
