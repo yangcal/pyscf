@@ -47,11 +47,28 @@ def tearDownModule():
     del mol, mf, gcc1
 
 class KnownValues(unittest.TestCase):
-
+    
     def test_gccsd(self):
         self.assertAlmostEqual(gcc1.e_corr, -0.10805861695870976, 7)
-
+    
     def test_ERIS(self):
+        from pyscf import cc
+        gcc = gccsd.GCCSD(mf, frozen=4)
+        numpy.random.seed(3)
+        mo_coeff0 = numpy.random.random(mf.mo_coeff.shape) - .9
+        nao = mo_coeff0.shape[0]//2
+
+        eris = gcc.ao2mo(mo_coeff0)
+
+        self.assertAlmostEqual(finger(eris.oooo), -66.2444338617287, 9)
+        self.assertAlmostEqual(finger(eris.ooov), -42.806270535661646, 9)
+        self.assertAlmostEqual(finger(eris.oovv), -160.91872537784818, 9)
+        self.assertAlmostEqual(finger(eris.ovov), -155.30962159420642, 9)
+        self.assertAlmostEqual(finger(eris.ovvv), 137.8215611319616, 9)
+        self.assertAlmostEqual(finger(eris.vvvv), 154.85637263549984, 9)
+ 
+    
+    def test_ERIS_orbspin(self):
         gcc = gccsd.GCCSD(mf, frozen=4)
         numpy.random.seed(9)
         mo_coeff0 = numpy.random.random(mf.mo_coeff.shape) - .9
@@ -148,7 +165,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(e[1], 7.093300636038563e-05, 6)
         self.assertAlmostEqual(e[2], 0.026861594481731924, 6)
         self.assertAlmostEqual(e[3], 0.045527827078651585, 6)
-
+    
 if __name__ == "__main__":
     print("Full Tests for GCCSD")
     unittest.main()

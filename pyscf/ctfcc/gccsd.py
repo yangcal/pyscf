@@ -178,7 +178,6 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
 
     cput1 = cput0 = (time.clock(), time.time())
     orbspin = eris.orbspin
-
     if orbspin is None:
         mo_a_o = asarray(mo_a[:,:nocc])
         mo_a_v = asarray(mo_a[:,nocc:])
@@ -189,34 +188,48 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
         PPoo, PPov, PPvv = make_ao_ints(mycc.mol, mo_b, nocc)
 
         oooo = einsum('uvmn,ui,vj->ijmn', ppoo, mo_a_o.conj(), mo_a_o)
+        oooo+= einsum('uvmn,ui,vj->ijmn', PPoo, mo_a_o.conj(), mo_a_o)
+        oooo+= einsum('uvmn,ui,vj->ijmn', ppoo, mo_b_o.conj(), mo_b_o)
         oooo+= einsum('uvmn,ui,vj->ijmn', PPoo, mo_b_o.conj(), mo_b_o)
         eris.oooo = oooo.transpose(0,2,1,3) - oooo.transpose(0,2,3,1)
 
         ooov = einsum('uvma,ui,vj->ijma', ppov, mo_a_o.conj(), mo_a_o)
+        ooov+= einsum('uvma,ui,vj->ijma', PPov, mo_a_o.conj(), mo_a_o)
+        ooov+= einsum('uvma,ui,vj->ijma', ppov, mo_b_o.conj(), mo_b_o)
         ooov+= einsum('uvma,ui,vj->ijma', PPov, mo_b_o.conj(), mo_b_o)
         eris.ooov = ooov.transpose(0,2,1,3) - ooov.transpose(2,0,1,3)
 
         ovov = einsum('uvmb,ui,va->iamb', ppov, mo_a_o.conj(), mo_a_v)
+        ovov+= einsum('uvmb,ui,va->iamb', PPov, mo_a_o.conj(), mo_a_v)
+        ovov+= einsum('uvmb,ui,va->iamb', ppov, mo_b_o.conj(), mo_b_v)
         ovov+= einsum('uvmb,ui,va->iamb', PPov, mo_b_o.conj(), mo_b_v)
         eris.oovv = ovov.transpose(0,2,1,3) - ovov.transpose(0,2,3,1)
         del ppoo, PPoo, oooo, ovov
 
         _ovvo = einsum('uvmb,ua,vi->mbai', ppov, mo_a_v.conj(), mo_a_o)
+        _ovvo+= einsum('uvmb,ua,vi->mbai', PPov, mo_a_v.conj(), mo_a_o)
+        _ovvo+= einsum('uvmb,ua,vi->mbai', ppov, mo_b_v.conj(), mo_b_o)
         _ovvo+= einsum('uvmb,ua,vi->mbai', PPov, mo_b_v.conj(), mo_b_o)
 
-        _oovv = einsum('uvab,vi,vj->ijab', ppvv, mo_a_o.conj(), mo_a_o)
-        _oovv+= einsum('uvab,vi,vj->ijab', PPvv, mo_b_o.conj(), mo_b_o)
+        _oovv = einsum('uvab,ui,vj->ijab', ppvv, mo_a_o.conj(), mo_a_o)
+        _oovv+= einsum('uvab,ui,vj->ijab', PPvv, mo_a_o.conj(), mo_a_o)
+        _oovv+= einsum('uvab,ui,vj->ijab', ppvv, mo_b_o.conj(), mo_b_o)
+        _oovv+= einsum('uvab,ui,vj->ijab', PPvv, mo_b_o.conj(), mo_b_o)
 
         eris.ovov = _oovv.transpose(0,2,1,3) - _ovvo.transpose(0,2,3,1)
         eris.ovvo = _ovvo.transpose(0,2,1,3) - _oovv.transpose(0,2,3,1)
         del _ovvo, _oovv, ppov, PPov
 
         ovvv = einsum('uvcd,ui,va->iacd', ppvv, mo_a_o.conj(), mo_a_v)
+        ovvv+= einsum('uvcd,ui,va->iacd', PPvv, mo_a_o.conj(), mo_a_v)
+        ovvv+= einsum('uvcd,ui,va->iacd', ppvv, mo_b_o.conj(), mo_b_v)
         ovvv+= einsum('uvcd,ui,va->iacd', PPvv, mo_b_o.conj(), mo_b_v)
         eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
 
-        vvvv = einsum('uvcd,ua,vb->iacd', ppvv, mo_a_v.conj(), mo_a_v)
-        vvvv+= einsum('uvcd,ua,vb->iacd', PPvv, mo_b_v.conj(), mo_b_v)
+        vvvv = einsum('uvcd,ua,vb->abcd', ppvv, mo_a_v.conj(), mo_a_v)
+        vvvv+= einsum('uvcd,ua,vb->abcd', PPvv, mo_a_v.conj(), mo_a_v)
+        vvvv+= einsum('uvcd,ua,vb->abcd', ppvv, mo_b_v.conj(), mo_b_v)
+        vvvv+= einsum('uvcd,ua,vb->abcd', PPvv, mo_b_v.conj(), mo_b_v)
         eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(0,2,3,1)
         del ovvv, vvvv, ppvv, PPvv
 
