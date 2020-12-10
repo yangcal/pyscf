@@ -177,58 +177,103 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     mo_b = eris.mo_coeff[nao//2:]
 
     cput1 = cput0 = (time.clock(), time.time())
-    ppoo, ppov, ppvv = make_ao_ints(mycc.mol, mo_a+mo_b, nocc)
     orbspin = eris.orbspin
-    occspin = orbspin[:nocc]
-    virspin = orbspin[nocc:]
 
-    oo = np.ones([nocc,nocc]) # delta tensors to force orbital symmetry
-    ov = np.ones([nocc,nvir])
-    vv = np.ones([nvir,nvir])
+    if orbspin is None:
+        mo_a_o = asarray(mo_a[:,:nocc])
+        mo_a_v = asarray(mo_a[:,nocc:])
+        mo_b_o = asarray(mo_b[:,:nocc])
+        mo_b_v = asarray(mo_b[:,nocc:])
 
-    oo[occspin[:,None]!=occspin] = 0
-    ov[occspin[:,None]!=virspin] = 0
-    vv[virspin[:,None]!=virspin] = 0
+        ppoo, ppov, ppvv = make_ao_ints(mycc.mol, mo_a, nocc)
+        PPoo, PPov, PPvv = make_ao_ints(mycc.mol, mo_b, nocc)
 
-    oo = asarray(oo)
-    ov = asarray(ov)
-    vv = asarray(vv)
+        oooo = einsum('uvmn,ui,vj->ijmn', ppoo, mo_a_o.conj(), mo_a_o)
+        oooo+= einsum('uvmn,ui,vj->ijmn', PPoo, mo_b_o.conj(), mo_b_o)
+        eris.oooo = oooo.transpose(0,2,1,3) - oooo.transpose(0,2,3,1)
 
-    ppoo = einsum('uvmn,mn->uvmn', ppoo, oo)
-    ppov = einsum('uvma,ma->uvma', ppov, ov)
-    ppvv = einsum('uvab,ab->uvab', ppvv, vv)
+        ooov = einsum('uvma,ui,vj->ijma', ppov, mo_a_o.conj(), mo_a_o)
+        ooov+= einsum('uvma,ui,vj->ijma', PPov, mo_b_o.conj(), mo_b_o)
+        eris.ooov = ooov.transpose(0,2,1,3) - ooov.transpose(2,0,1,3)
 
-    cput1 = logger.timer(mycc, 'making ao integrals', *cput1)
-    mo = asarray(mo_a+mo_b)
-    orbo, orbv = mo[:,:nocc], mo[:,nocc:]
+        ovov = einsum('uvmb,ui,va->iamb', ppov, mo_a_o.conj(), mo_a_v)
+        ovov+= einsum('uvmb,ui,va->iamb', PPov, mo_b_o.conj(), mo_b_v)
+        eris.oovv = ovov.transpose(0,2,1,3) - ovov.transpose(0,2,3,1)
+        del ppoo, PPoo, oooo, ovov
 
-    tmp = einsum('uvmn,ui->ivmn', ppoo, orbo)
-    oooo = einsum('ivmn,vj,ij->ijmn', tmp, orbo, oo)
+        _ovvo = einsum('uvmb,ua,vi->mbai', ppov, mo_a_v.conj(), mo_a_o)
+        _ovvo+= einsum('uvmb,ua,vi->mbai', PPov, mo_b_v.conj(), mo_b_o)
 
-    eris.oooo = oooo.transpose(0,2,1,3) - oooo.transpose(0,2,3,1)
-    ooov = einsum('ivmn,va,ia->mnia', tmp, orbv,ov)
-    eris.ooov = ooov.transpose(0,2,1,3) - ooov.transpose(2,0,1,3)
+        _oovv = einsum('uvab,vi,vj->ijab', ppvv, mo_a_o.conj(), mo_a_o)
+        _oovv+= einsum('uvab,vi,vj->ijab', PPvv, mo_b_o.conj(), mo_b_o)
 
-    tmp = einsum('uvma,vb->ubma', ppov, orbv)
-    ovov = einsum('ubma,ui,ib->ibma', tmp, orbo, ov)
-    eris.oovv = ovov.transpose(0,2,1,3) - ovov.transpose(0,2,3,1)
-    del ppoo, ovov, tmp
+        eris.ovov = _oovv.transpose(0,2,1,3) - _ovvo.transpose(0,2,3,1)
+        eris.ovvo = _ovvo.transpose(0,2,1,3) - _oovv.transpose(0,2,3,1)
+        del _ovvo, _oovv, ppov, PPov
 
-    tmp = einsum('uvma,ub->mabv', ppov, orbv)
-    _ovvo = einsum('mabv,vi,ib->mabi', tmp, orbo, ov)
-    tmp = einsum('uvab,ui->ivab', ppvv, orbo)
-    _oovv = einsum('ivab,vj,ij->ijab', tmp, orbo,oo)
+        ovvv = einsum('uvcd,ui,va->iacd', ppvv, mo_a_o.conj(), mo_a_v)
+        ovvv+= einsum('uvcd,ui,va->iacd', PPvv, mo_b_o.conj(), mo_b_v)
+        eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
 
-    eris.ovov = _oovv.transpose(0,2,1,3) - _ovvo.transpose(0,2,3,1)
-    eris.ovvo = _ovvo.transpose(0,2,1,3) - _oovv.transpose(0,2,3,1)
-    del _ovvo, _oovv, ppov, tmp
+        vvvv = einsum('uvcd,ua,vb->iacd', ppvv, mo_a_v.conj(), mo_a_v)
+        vvvv+= einsum('uvcd,ua,vb->iacd', PPvv, mo_b_v.conj(), mo_b_v)
+        eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(0,2,3,1)
+        del ovvv, vvvv, ppvv, PPvv
 
-    tmp = einsum('uvab,vc->ucab', ppvv, orbv)
-    ovvv = einsum('ucab,ui,ic->icab', tmp, orbo, ov)
-    eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
-    vvvv = einsum('ucab,ud,dc->dcab', tmp, orbv, vv)
-    eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(0,2,3,1)
-    del ovvv, vvvv, ppvv, tmp
+    else:
+        ppoo, ppov, ppvv = make_ao_ints(mycc.mol, mo_a+mo_b, nocc)
+
+        occspin = orbspin[:nocc]
+        virspin = orbspin[nocc:]
+
+        oo = np.ones([nocc,nocc]) # delta tensors to force orbital symmetry
+        ov = np.ones([nocc,nvir])
+        vv = np.ones([nvir,nvir])
+
+        oo[occspin[:,None]!=occspin] = 0
+        ov[occspin[:,None]!=virspin] = 0
+        vv[virspin[:,None]!=virspin] = 0
+
+        oo = asarray(oo)
+        ov = asarray(ov)
+        vv = asarray(vv)
+
+        ppoo = einsum('uvmn,mn->uvmn', ppoo, oo)
+        ppov = einsum('uvma,ma->uvma', ppov, ov)
+        ppvv = einsum('uvab,ab->uvab', ppvv, vv)
+
+        cput1 = logger.timer(mycc, 'making ao integrals', *cput1)
+        mo = asarray(mo_a+mo_b)
+        orbo, orbv = mo[:,:nocc], mo[:,nocc:]
+
+        tmp = einsum('uvmn,ui->ivmn', ppoo, orbo)
+        oooo = einsum('ivmn,vj,ij->ijmn', tmp, orbo, oo)
+
+        eris.oooo = oooo.transpose(0,2,1,3) - oooo.transpose(0,2,3,1)
+        ooov = einsum('ivmn,va,ia->mnia', tmp, orbv,ov)
+        eris.ooov = ooov.transpose(0,2,1,3) - ooov.transpose(2,0,1,3)
+
+        tmp = einsum('uvma,vb->ubma', ppov, orbv)
+        ovov = einsum('ubma,ui,ib->ibma', tmp, orbo, ov)
+        eris.oovv = ovov.transpose(0,2,1,3) - ovov.transpose(0,2,3,1)
+        del ppoo, ovov, tmp
+
+        tmp = einsum('uvma,ub->mabv', ppov, orbv)
+        _ovvo = einsum('mabv,vi,ib->mabi', tmp, orbo, ov)
+        tmp = einsum('uvab,ui->ivab', ppvv, orbo)
+        _oovv = einsum('ivab,vj,ij->ijab', tmp, orbo,oo)
+
+        eris.ovov = _oovv.transpose(0,2,1,3) - _ovvo.transpose(0,2,3,1)
+        eris.ovvo = _ovvo.transpose(0,2,1,3) - _oovv.transpose(0,2,3,1)
+        del _ovvo, _oovv, ppov, tmp
+
+        tmp = einsum('uvab,vc->ucab', ppvv, orbv)
+        ovvv = einsum('ucab,ui,ic->icab', tmp, orbo, ov)
+        eris.ovvv = ovvv.transpose(0,2,1,3) - ovvv.transpose(0,2,3,1)
+        vvvv = einsum('ucab,ud,dc->dcab', tmp, orbv, vv)
+        eris.vvvv = vvvv.transpose(0,2,1,3) - vvvv.transpose(0,2,3,1)
+        del ovvv, vvvv, ppvv, tmp
+
     logger.timer(mycc, 'ao2mo transformation', *cput0)
     return eris
 
